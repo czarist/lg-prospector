@@ -1,0 +1,9 @@
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
+  --focus-rs \
+  --max-tier 2 \
+  -n 5 \
+  --stages discover,enrich,crm,dispatch \
+  --cooldown-days 4 \
+  --pause 8 \
+  --cycle-pause 60

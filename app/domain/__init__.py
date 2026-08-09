@@ -1,0 +1,1 @@
+"""Camada de domínio."""
