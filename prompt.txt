@@ -1,3 +1,4 @@
+# --- Prospecção (contínua, roda em background) ---
 cd /home/lucas/lg-prospector && source .venv/bin/activate && \
 PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
   --focus-rs \
@@ -7,3 +8,14 @@ PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
   --cooldown-days 4 \
   --pause 8 \
   --cycle-pause 60
+
+# --- Revisão de qualidade (rodar à parte, com a prospecção parada ou só em modo leitura) ---
+# Sem --apply-requeue: só relatório (logs/data_quality_review.jsonl), não toca no banco.
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/review_data_quality.py \
+  --stages crm_synced,sent \
+  -n 150
+
+# Com --apply-requeue (reenfileira itens com registro CRM ausente/divergente):
+# parar o hunt_loop.py antes de rodar, para evitar corrida no mesmo item.
+# python scripts/review_data_quality.py --stages crm_synced,sent -n 150 --apply-requeue

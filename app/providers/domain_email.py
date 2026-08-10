@@ -70,7 +70,11 @@ def extract_registrable_domain(url_or_host: str) -> str:
         return ""
     if "://" not in raw:
         raw = "https://" + raw
-    host = urlparse(raw).netloc or urlparse(raw).path
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return ""
+    host = parsed.netloc or parsed.path
     host = host.split("@")[-1].split(":")[0].strip().removeprefix("www.")
     if not host or "." not in host:
         return host

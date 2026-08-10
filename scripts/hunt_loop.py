@@ -305,8 +305,29 @@ async def _run_one(
                     if not result.get("need_more_discover"):
                         break
                     _echo(f"  … reforço discover/enrich {r+1}/3")
-                    await stage_svc.run_stage(cid, "discover")
-                    result = await stage_svc.run_stage(cid, "enrich")
+                    try:
+                        await stage_svc.run_stage(cid, "discover")
+                        result = await stage_svc.run_stage(cid, "enrich")
+                    except Exception as reforco_exc:
+                        # não deixa um reforço falho derrubar o job inteiro:
+                        # segue com o que já foi enriquecido até aqui (crm/dispatch).
+                        # rollback é obrigatório: uma exceção a meio de run_stage()
+                        # deixa a sessão numa transação abortada.
+                        await session.rollback()
+                        err = {
+                            "event": "stage_error",
+                            "niche": niche,
+                            "city": city.city,
+                            "state": city.state,
+                            "campaign_id": cid,
+                            "stage": "enrich_retry",
+                            "error": str(reforco_exc),
+                            "error_type": type(reforco_exc).__name__,
+                        }
+                        if file_log:
+                            file_log.error(err)
+                        _echo(f"  ✗ reforço discover/enrich falhou (seguindo com o que há): {reforco_exc}")
+                        break
                     stage_results["enrich"] = result
                     _echo(f"  {result}")
                     if file_log:

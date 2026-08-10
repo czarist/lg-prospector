@@ -11,8 +11,11 @@ Fluxo multi-pass:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 from urllib.parse import urlparse
+
+from email_validator import EmailNotValidError, validate_email
 
 from app.core.logging import get_logger
 from app.domain.entities.provider_result import ProviderResult
@@ -31,6 +34,22 @@ from app.providers.scraper import (
 from app.providers.search_free import ddg_search
 
 logger = get_logger(__name__)
+
+
+async def verify_email_deliverable(email: str) -> tuple[bool, str | None]:
+    """Confirma (best-effort, sem enviar nada) que o domínio do e-mail existe e
+    tem registro MX/A — pega os casos de "domínio inventado/não existe" antes
+    do envio. Não garante que a caixa postal específica exista (isso exigiria
+    handshake SMTP com RCPT TO, que a maioria dos provedores/redes bloqueia ou
+    responde de forma não confiável para probes)."""
+    try:
+        await asyncio.to_thread(validate_email, email, check_deliverability=True)
+        return True, None
+    except EmailNotValidError as exc:
+        return False, str(exc)
+    except Exception as exc:  # DNS instável/timeout — não descarta por falha da checagem
+        logger.debug("email_deliverability_check_error", email=email, error=str(exc))
+        return True, None
 
 
 def has_valid_email(value: str | None) -> bool:
@@ -228,6 +247,19 @@ async def require_email(
             company=result.company_name,
         )
         return None
+
+    from app.core.config import get_settings
+
+    if get_settings().enrich_verify_email_dns:
+        deliverable, reason = await verify_email_deliverable(result.email)
+        if not deliverable:
+            logger.info(
+                "lead_discarded_email_undeliverable",
+                email=result.email,
+                company=result.company_name,
+                reason=reason,
+            )
+            return None
 
     return result
 

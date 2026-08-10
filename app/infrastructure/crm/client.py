@@ -229,6 +229,21 @@ class CRMClient:
     async def get(self, entity: str, record_id: str) -> dict[str, Any]:
         return await self.request("GET", f"/{entity}/{record_id}")
 
+    async def exists(self, entity: str, record_id: str) -> bool:
+        """GET /{Entity}/{id} sem retry/circuit-breaker: 404 aqui é um resultado de
+        negócio válido (registro apagado/nunca existiu no CRM), não falha de infra —
+        varrer muitos IDs ausentes via ``request()`` abriria o circuit breaker
+        (``failure_threshold=5``) e bloquearia o resto da checagem."""
+        if self._dry_run or not self._enabled:
+            return True
+        url = f"{self.base_url}/{entity}/{record_id}"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers=self._auth_header())
+        if resp.status_code == 404:
+            return False
+        resp.raise_for_status()
+        return True
+
     async def create(self, entity: str, data: dict[str, Any]) -> dict[str, Any]:
         return await self.request("POST", f"/{entity}", json=data)
 

@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -175,6 +176,23 @@ class StageService:
             if n:
                 existing_names.add(n)
 
+        # já existentes globalmente (outras campanhas/ciclos) — a constraint
+        # uq_company_name_city_host é da tabela inteira, não só desta campanha
+        # (o "escada de cidades" cria uma campanha nova por cidade/nicho/ciclo,
+        # então sem isso a mesma empresa colide de novo a cada rodada)
+        global_rows = (
+            await self.session.execute(
+                select(Company.name, Company.website_host).where(
+                    Company.city == (campaign.city or "")
+                )
+            )
+        ).all()
+        for g_name, g_host in global_rows:
+            if g_name:
+                existing_names.add(g_name.strip().lower())
+            if g_host:
+                existing_hosts.add(g_host.strip().lower())
+
         seen: set[str] = set()
         created = 0
         for pr in found:
@@ -209,7 +227,22 @@ class StageService:
                 extra=pr.extra,
             )
             self.session.add(company)
-            await self.session.flush()
+            try:
+                async with self.session.begin_nested():
+                    await self.session.flush()
+            except IntegrityError:
+                self.session.expunge(company)
+                logger.info(
+                    "discover_duplicate_skipped",
+                    name=company.name,
+                    city=company.city,
+                    host=website_host,
+                )
+                if website_host:
+                    existing_hosts.add(website_host.lower())
+                if name_l:
+                    existing_names.add(name_l)
+                continue
 
             item = CampaignItem(
                 id=uuid4().hex,

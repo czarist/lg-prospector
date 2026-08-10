@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     enrich_batch_pause_seconds: float = 0.4
     enrich_max_domain_queries: int = 3
     enrich_playwright: bool = False  # Playwright só se true (pesado)
+    enrich_verify_email_dns: bool = True  # confere MX/A do domínio antes de aceitar o e-mail
     scrape_concurrency: int = 2
     playwright_concurrency: int = 1
     # discover: quantos candidatos buscar por rodada (múltiplo de max_results)
