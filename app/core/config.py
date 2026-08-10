@@ -89,10 +89,16 @@ class Settings(BaseSettings):
     enrich_verify_email_dns: bool = True  # confere MX/A do domínio antes de aceitar o e-mail
     scrape_concurrency: int = 2
     playwright_concurrency: int = 1
-    # discover: quantos candidatos buscar por rodada (múltiplo de max_results)
-    discover_overfetch_factor: int = 3
+    # discover: quantos candidatos buscar por rodada (múltiplo de max_results).
+    # Maior aqui não custa Serper extra (é "num" na mesma call) — só mais itens
+    # pro filtro LLM decidir; evita rodadas inteiras de "reforço" (que sim são caras,
+    # cada uma refaz discover+enrich com scrape/DDG).
+    discover_overfetch_factor: int = 5
     # LLM local (LiteLLM/Qwen) — OFF por padrão; caçada atual não depende dele
     hunt_use_llm: bool = True
+    # keep=true do LLM só é aceito se o score também bater esse mínimo
+    # (pega os casos em que o modelo marca keep=true por inércia mas dá score baixo)
+    discover_min_llm_score: int = 40
     llm_concurrency: int = 1
     llm_timeout_seconds: float = 60.0
     llm_max_tokens: int = 140

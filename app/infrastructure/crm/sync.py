@@ -48,6 +48,21 @@ def split_name(full: str) -> tuple[str, str]:
     return parts[0][:100], parts[1][:100]
 
 
+def _mismatched_email(record: dict[str, Any], email: str) -> bool:
+    """Espo detecta duplicidade de Contact/Lead por NOME, não por e-mail — um
+    create() pode voltar (via 409) um registro "duplicado" de outra pessoa/cidade
+    cujo nome bateu mas o e-mail é outro (comum em nomes institucionais genéricos
+    como "Gabinete do Prefeito"). Isso é o que causa contact_id/lead_id local
+    apontando pro registro errado no CRM."""
+    returned = (record.get("emailAddress") or "").strip().lower()
+    return bool(returned) and returned != (email or "").strip().lower()
+
+
+def _disambiguated_last_name(last: str, city: str, email: str) -> str:
+    tag = city or email.rsplit("@", 1)[-1]
+    return f"{(last or '.').strip()} ({tag})"[:100]
+
+
 @dataclass
 class CRMSyncResult:
     account_id: Optional[str] = None
@@ -129,7 +144,8 @@ class CRMSyncService:
             except Exception as exc2:
                 result.errors.append(f"Account retry: {exc2}")
 
-        # --- Contact (create reutiliza 409 = duplicado) ---
+        # --- Contact (create pode devolver via 409 um "duplicado" por NOME —
+        # ver _mismatched_email) ---
         try:
             existing = await self.contacts.find_by_email(email)
             if existing and existing.get("id"):
@@ -143,6 +159,21 @@ class CRMSyncService:
                     account_id=result.account_id or "",
                     description=desc,
                 )
+                if _mismatched_email(ct, email):
+                    logger.warning(
+                        "crm_contact_name_collision",
+                        intended_email=email,
+                        reused_email=ct.get("emailAddress"),
+                        reused_id=ct.get("id"),
+                    )
+                    ct = await self.contacts.create(
+                        first,
+                        _disambiguated_last_name(last, city, email),
+                        email=email,
+                        phone=phone_ok,
+                        account_id=result.account_id or "",
+                        description=desc,
+                    )
                 result.contact_id = ct.get("id")
             if result.account_id and result.contact_id:
                 try:
@@ -166,6 +197,22 @@ class CRMSyncService:
                         **({"accountId": result.account_id} if result.account_id else {}),
                     },
                 )
+                if _mismatched_email(ct, email):
+                    logger.warning(
+                        "crm_contact_name_collision",
+                        intended_email=email,
+                        reused_email=ct.get("emailAddress"),
+                        reused_id=ct.get("id"),
+                    )
+                    ct = await self.client.create(
+                        "Contact",
+                        {
+                            "firstName": first,
+                            "lastName": _disambiguated_last_name(last, city, email),
+                            "emailAddress": email,
+                            **({"accountId": result.account_id} if result.account_id else {}),
+                        },
+                    )
                 result.contact_id = ct.get("id")
             except Exception as exc2:
                 result.errors.append(f"Contact retry: {exc2}")
@@ -190,6 +237,27 @@ class CRMSyncService:
                     address_city=city or "",
                     address_state=state or "",
                 )
+                if _mismatched_email(lead, email):
+                    logger.warning(
+                        "crm_lead_name_collision",
+                        intended_email=email,
+                        reused_email=lead.get("emailAddress"),
+                        reused_id=lead.get("id"),
+                    )
+                    lead = await self.leads.create(
+                        first,
+                        _disambiguated_last_name(last, city, email),
+                        email=email,
+                        phone=phone_ok,
+                        account_name=account_name,
+                        website=website or "",
+                        source="Web Site",
+                        status="New",
+                        description=desc,
+                        industry="",
+                        address_city=city or "",
+                        address_state=state or "",
+                    )
                 result.lead_id = lead.get("id")
         except Exception as exc:
             result.errors.append(f"Lead: {exc}")
@@ -206,6 +274,24 @@ class CRMSyncService:
                         "accountName": account_name,
                     },
                 )
+                if _mismatched_email(lead, email):
+                    logger.warning(
+                        "crm_lead_name_collision",
+                        intended_email=email,
+                        reused_email=lead.get("emailAddress"),
+                        reused_id=lead.get("id"),
+                    )
+                    lead = await self.client.create(
+                        "Lead",
+                        {
+                            "firstName": first,
+                            "lastName": _disambiguated_last_name(last, city, email),
+                            "status": "New",
+                            "source": "Web Site",
+                            "emailAddress": email,
+                            "accountName": account_name,
+                        },
+                    )
                 result.lead_id = lead.get("id")
             except Exception as exc2:
                 result.errors.append(f"Lead retry: {exc2}")

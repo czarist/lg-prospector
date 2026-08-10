@@ -93,7 +93,10 @@ async def _ddg_html(query: str, num: int) -> list[dict[str, Any]]:
     }
     data = {"q": query, "b": "", "kl": "br-pt"}
     try:
-        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True, headers=headers) as client:
+        # timeout curto de propósito: quando esse backend está bloqueado/lento ele
+        # nunca responde (visto em produção: 25s parado antes de cair pro fallback
+        # que funciona) — 8s já é folgado pro caso feliz e corta o tempo morto no ruim
+        async with httpx.AsyncClient(timeout=8.0, follow_redirects=True, headers=headers) as client:
             resp = await client.post(url, data=data)
             if resp.status_code >= 400:
                 logger.warning("ddg_html_status", status=resp.status_code)

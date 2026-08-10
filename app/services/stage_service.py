@@ -12,6 +12,7 @@ Cada etapa avança current_stage e só processa itens no estado certo.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -44,6 +45,21 @@ from app.providers.email_enrichment import has_valid_email, require_email
 from app.providers.registry import get_provider_registry
 
 logger = get_logger(__name__)
+
+# sufixos de tipo societário BR — "Advocacia Silva" e "Advocacia Silva Ltda" são
+# a mesma empresa pro dedup, mas escapavam da comparação por string exata
+_LEGAL_SUFFIX_RE = re.compile(
+    r"[\s\-,.]+(ltda\.?|eireli|eirl|epp|s\.?/?a\.?|m\.?e\.?|ei|ss)\.?$", re.IGNORECASE
+)
+
+
+def _normalize_company_name(name: str) -> str:
+    n = (name or "").strip().lower()
+    prev = None
+    while prev != n:
+        prev = n
+        n = _LEGAL_SUFFIX_RE.sub("", n).strip()
+    return n
 
 
 class StageService:
@@ -134,7 +150,7 @@ class StageService:
                     niche=campaign.niche,
                     city=campaign.city or "",
                 )
-                if score.get("keep", True):
+                if score.get("keep", True) and int(score.get("score") or 0) >= settings.discover_min_llm_score:
                     # aplica nome limpo quando o modelo devolver
                     cn = (score.get("clean_name") or "").strip()
                     if cn and len(cn) > 2:
@@ -170,9 +186,9 @@ class StageService:
             if it.company_domain:
                 existing_hosts.add(it.company_domain.lower())
             if it.company:
-                existing_names.add((it.company.name or "").strip().lower())
+                existing_names.add(_normalize_company_name(it.company.name))
             raw = it.raw_data or {}
-            n = (raw.get("company_name") or "").strip().lower()
+            n = _normalize_company_name(raw.get("company_name") or "")
             if n:
                 existing_names.add(n)
 
@@ -189,7 +205,7 @@ class StageService:
         ).all()
         for g_name, g_host in global_rows:
             if g_name:
-                existing_names.add(g_name.strip().lower())
+                existing_names.add(_normalize_company_name(g_name))
             if g_host:
                 existing_hosts.add(g_host.strip().lower())
 
@@ -205,7 +221,7 @@ class StageService:
             seen.add(key)
 
             domain = extract_registrable_domain(pr.website or "")
-            name_l = (pr.company_name or "").strip().lower()
+            name_l = _normalize_company_name(pr.company_name or "")
             if domain and domain.lower() in existing_hosts:
                 continue
             if name_l and name_l in existing_names:
