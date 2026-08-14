@@ -43,20 +43,49 @@ PREFERRED_LOCALS = (
 )
 
 FREE_MAIL = {
+    # Google
     "gmail.com",
     "googlemail.com",
+    # Microsoft
     "hotmail.com",
+    "hotmail.com.br",
     "outlook.com",
+    "outlook.com.br",
     "live.com",
+    "live.com.br",
+    "msn.com",
+    "msn.com.br",
+    "windowslive.com",
+    # Yahoo
     "yahoo.com",
     "yahoo.com.br",
+    "ymail.com",
+    "rocketmail.com",
+    # Apple
     "icloud.com",
+    "me.com",
+    "mac.com",
+    # Portais BR
     "uol.com.br",
     "bol.com.br",
     "terra.com.br",
     "ig.com.br",
+    "globomail.com",
+    "globo.com",
+    "zipmail.com.br",
+    "r7.com",
+    "oi.com.br",
+    "pop.com.br",
+    "superig.com.br",
+    # Outros comuns
     "proton.me",
     "protonmail.com",
+    "aol.com",
+    "gmx.com",
+    "gmx.net",
+    "mail.com",
+    "zoho.com",
+    "zohomail.com",
 }
 
 

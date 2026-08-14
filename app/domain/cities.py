@@ -208,6 +208,9 @@ NICHE_QUERIES: dict[str, list[str]] = {
         "sociedade de advogados",
         "advogado empresarial",
         "advogados associados",
+        "escritório advocacia trabalhista",
+        "advogado cível escritório",
+        "sociedade de advogados OAB",
     ],
     "agencia_marketing": [
         "agência de marketing digital",
@@ -234,14 +237,26 @@ NICHE_QUERIES: dict[str, list[str]] = {
         "rádio jornal",
     ],
     "politico": [
-        "deputado estadual gabinete contato",
-        "deputado federal gabinete email",
-        "vereador contato email",
-        "partido político diretório",
+        # NÃO usar "gabinete" / portais .leg.br — puxa assembleia/câmara
+        "diretório municipal partido contato",
+        "diretório estadual partido contato",
+        "comissão provisória partido",
+        "candidato campanha site contato",
+        "equipe de campanha contato email",
+        "partido político diretório site oficial",
+    ],
+    "generalista": [
+        "empresa comércio site contato",
+        "clínica consultório site",
+        "imobiliária site contato",
+        "restaurante site institucional",
+        "oficina loja indústria site",
+        "prestador de serviço empresa site",
     ],
 }
 
-DEFAULT_NICHES: list[str] = list(NICHE_QUERIES.keys())
+# hunt_loop de nicho — sem generalista (rotina própria)
+DEFAULT_NICHES: list[str] = [k for k in NICHE_QUERIES if k != "generalista"]
 
 
 def pick_query(niche: str, city: str, round_idx: int = 0) -> str:

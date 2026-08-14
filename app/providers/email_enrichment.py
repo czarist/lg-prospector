@@ -4,7 +4,7 @@ Fluxo multi-pass:
 1. Já tem e-mail do domínio → ok
 2. Scrape site (httpx) → filtra *@dominio
 3. Scrape deep (Playwright) → filtra *@dominio
-4. Busca web no domínio (DDG/Bing): site:dominio, "@dominio", contato@dominio
+4. Busca web no domínio (mesmo backend do discover — Serper se houver key)
 5. Sem e-mail do domínio → tenta free-mail só se allow_free_mail
 6. Sem e-mail → descartar
 """
@@ -25,13 +25,14 @@ from app.providers.domain_email import (
     matches_company_domain,
     pick_best_email,
 )
+from app.providers.geo_email import classify_contact_email, email_needs_llm_review
 from app.providers.scraper import (
     EMAIL_RE,
     extract_emails,
     normalize_url,
     scrape_website,
 )
-from app.providers.search_free import ddg_search
+from app.providers.http_tools import web_search
 
 logger = get_logger(__name__)
 
@@ -68,6 +69,23 @@ def company_domain_of(contact: ProviderResult) -> str:
     return extract_registrable_domain(contact.website or "")
 
 
+def _party_of(contact: ProviderResult) -> str:
+    extra = contact.extra or {}
+    return str(extra.get("tse_partido") or extra.get("partido") or "")
+
+
+def email_fits_contact(email: str, contact: ProviderResult) -> tuple[bool, str]:
+    """Sintaxe + geo/nome: e-mail tem que parecer do lead, não de um SERP aleatório."""
+    return classify_contact_email(
+        email,
+        name=contact.contact_name or contact.company_name or "",
+        city=contact.city or "",
+        party=_party_of(contact),
+        website=contact.website or "",
+        segment=contact.segment or "",
+    )
+
+
 async def find_email_multi_pass(
     contact: ProviderResult,
     *,
@@ -85,7 +103,16 @@ async def find_email_multi_pass(
     # 0) já tem e-mail
     if has_valid_email(contact.email):
         contact.email = normalize_email(contact.email)
-        if require_domain and domain and not matches_company_domain(contact.email, domain):
+        seed_ok, seed_reason = email_fits_contact(contact.email, contact)
+        if not seed_ok:
+            logger.info(
+                "email_seed_implausible_continue",
+                email=contact.email,
+                reason=seed_reason,
+                company=contact.company_name,
+            )
+            contact.email = ""
+        elif require_domain and domain and not matches_company_domain(contact.email, domain):
             # e-mail genérico (gmail etc.) — continua buscando do domínio
             logger.info(
                 "email_not_on_domain_continue",
@@ -96,13 +123,14 @@ async def find_email_multi_pass(
             return contact
 
     def _accept(candidates: list[str], source: str) -> bool:
+        plausible = [c for c in candidates if email_fits_contact(c, contact)[0]]
         best = pick_best_email(
-            candidates,
+            plausible,
             company_domain=domain,
             require_domain=require_domain and bool(domain),
         )
         if not best and allow_free_mail and not require_domain:
-            best = pick_best_email(candidates, company_domain=domain, require_domain=False)
+            best = pick_best_email(plausible, company_domain=domain, require_domain=False)
         if best:
             contact.email = best
             _merge_extra(contact, {"email_source": source, "email_domain": domain})
@@ -195,7 +223,12 @@ async def _search_domain_or_company(
     all_emails: list[str] = []
     for q in queries[:max_q]:
         try:
-            results = await ddg_search(q, num=8)
+            results = await web_search(
+                q,
+                num=8,
+                city=contact.city or "",
+                state=contact.state or "",
+            )
         except Exception as exc:
             logger.debug("domain_search_failed", query=q, error=str(exc))
             continue
@@ -216,16 +249,24 @@ async def require_email(
     *,
     deep: bool = True,
     require_domain: bool = True,
+    allow_free_mail: bool | None = None,
 ) -> Optional[ProviderResult]:
     """
     Enriquecer e-mail do domínio. Sem e-mail válido → None (descartar).
+
+    allow_free_mail=None → só se não houver domínio de site (padrão).
+    Para político/campanha passe True (equipes usam gmail etc.).
     """
     domain = company_domain_of(contact)
+    if allow_free_mail is None:
+        allow_free_mail = not domain
+    # se já tem e-mail e free-mail liberado, não força domínio
+    req_dom = require_domain and bool(domain) and not allow_free_mail
     result = await find_email_multi_pass(
         contact,
         deep=deep,
-        require_domain=require_domain and bool(domain),
-        allow_free_mail=not domain,  # sem site/domínio, aceita o que achar
+        require_domain=req_dom,
+        allow_free_mail=allow_free_mail,
     )
     if not has_valid_email(result.email):
         logger.info(
@@ -238,13 +279,54 @@ async def require_email(
 
     result.email = normalize_email(result.email)
 
-    # se exige domínio e não bate, descarta
-    if require_domain and domain and not matches_company_domain(result.email, domain):
+    fit_ok, fit_reason = email_fits_contact(result.email, result)
+    if not fit_ok:
+        logger.info(
+            "lead_discarded_email_implausible",
+            email=result.email,
+            company=result.company_name,
+            reason=fit_reason,
+        )
+        return None
+
+    # se exige domínio e não bate, descarta (exceto free-mail liberado)
+    if (
+        require_domain
+        and domain
+        and not allow_free_mail
+        and not matches_company_domain(result.email, domain)
+    ):
         logger.info(
             "lead_discarded_email_wrong_domain",
             email=result.email,
             domain=domain,
             company=result.company_name,
+        )
+        return None
+
+    # nunca aceitar e-mail de órgão público / .gov / .leg / .jus
+    from app.providers.public_org import is_public_email, is_public_organ
+
+    allow_gov = (result.segment or "").lower() == "generalista"
+    if is_public_email(result.email, allow_gov_br=allow_gov):
+        logger.info(
+            "lead_discarded_public_email",
+            email=result.email,
+            company=result.company_name,
+        )
+        return None
+    if is_public_organ(
+        name=result.company_name or "",
+        website=result.website or "",
+        email=result.email or "",
+        segment=result.segment or "",
+        allow_gov_br=allow_gov,
+    ):
+        logger.info(
+            "lead_discarded_public_organ",
+            email=result.email,
+            company=result.company_name,
+            website=result.website,
         )
         return None
 
@@ -258,6 +340,29 @@ async def require_email(
                 email=result.email,
                 company=result.company_name,
                 reason=reason,
+            )
+            return None
+
+    if email_needs_llm_review(result.email):
+        from app.infrastructure.llm.client import score_email_belongs_to_business
+
+        snippet = str((result.extra or {}).get("snippet") or "")
+        verdict = await score_email_belongs_to_business(
+            email=result.email,
+            name=result.contact_name or result.company_name or "",
+            website=result.website or "",
+            city=result.city or "",
+            segment=result.segment or "",
+            snippet=snippet,
+        )
+        _merge_extra(result, {"llm_email": verdict})
+        if not verdict.get("keep", True):
+            logger.info(
+                "lead_discarded_email_llm",
+                email=result.email,
+                company=result.company_name,
+                reason=verdict.get("reason"),
+                score=verdict.get("score"),
             )
             return None
 
