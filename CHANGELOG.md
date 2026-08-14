@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.1.1
+
+- Mailman pages past junk niche leads instead of stalling on an empty pair.
+- Cockpit shows niche vs generalist queue counts when a pair cannot be formed.
+- Host helper script to mask sleep/hibernate and ignore idle power-off.
+
 ## 2.0.1
 
 - Split prospecting from sending: hunts only discover, mailman sends mail.

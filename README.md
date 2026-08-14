@@ -1,6 +1,6 @@
 # LG Prospector
 
-**v2.0.1** — A Brazilian B2B lead factory. It finds companies, attaches a real mailbox, syncs them to EspoCRM, and sends a niche-specific HTML pitch — slowly enough that it does not look like a blast.
+**v2.0.1.1** — A Brazilian B2B lead factory. It finds companies, attaches a real mailbox, syncs them to EspoCRM, and sends a niche-specific HTML pitch — slowly enough that it does not look like a blast.
 
 Hunts only **discover**. **Mailman** is the only sender. **Cockpit** starts both and shows the live panel.
 
