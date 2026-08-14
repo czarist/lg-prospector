@@ -16,9 +16,10 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-# data:image/png;base64,....  ou svg+xml
+# data:image/png;base64,...  |  data:image/svg+xml;charset=utf-8;base64,...
 DATA_URI_RE = re.compile(
-    r"""(["'])data:image/(png|jpeg|jpg|gif|webp|svg\+xml);base64,([A-Za-z0-9+/=\s]+)\1""",
+    r"""(["'])data:image/(png|jpeg|jpg|gif|webp|svg\+xml)"""
+    r"""(?:;charset=[^;,'"]+)?;base64,([A-Za-z0-9+/=\s]+)\1""",
     re.IGNORECASE,
 )
 
@@ -60,11 +61,7 @@ def _decode_b64(payload: str) -> bytes:
     return base64.b64decode(cleaned)
 
 
-async def svg_bytes_to_png(svg_bytes: bytes) -> bytes:
-    """Renderiza SVG → PNG via Playwright (Chromium)."""
-    from playwright.async_api import async_playwright
-
-    # Tenta extrair width/height do SVG para viewport razoável
+def _svg_viewport(svg_bytes: bytes) -> tuple[int, int]:
     text = svg_bytes.decode("utf-8", errors="replace")
     width, height = 200, 200
     wm = re.search(r'\bwidth=["\']?(\d+)', text, re.I)
@@ -73,12 +70,48 @@ async def svg_bytes_to_png(svg_bytes: bytes) -> bytes:
         width = max(16, min(1200, int(wm.group(1))))
     if hm:
         height = max(16, min(1200, int(hm.group(1))))
-    # viewBox fallback
     vb = re.search(r'viewBox=["\']?\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)', text, re.I)
     if vb and (not wm or not hm):
         width = max(16, min(1200, int(float(vb.group(1)))))
         height = max(16, min(1200, int(float(vb.group(2)))))
+    return width, height
 
+
+def flatten_png(png_bytes: bytes, *, bg: tuple[int, int, int] | None = None) -> bytes:
+    """PNG com transparência vira RGB opaco — Gmail/Outlook não 'comem' o ícone."""
+    from io import BytesIO
+
+    from PIL import Image
+
+    im = Image.open(BytesIO(png_bytes)).convert("RGBA")
+    alpha = im.getchannel("A")
+    if alpha.getextrema() == (255, 255):
+        out = BytesIO()
+        im.convert("RGB").save(out, format="PNG", optimize=True)
+        return out.getvalue()
+
+    # fundo: se o desenho é claro, usa escuro; se é escuro/verde, usa branco
+    if bg is None:
+        samples = list(im.getdata())
+        opaque = [px for px in samples[:: max(1, len(samples) // 400)] if px[3] > 40]
+        if opaque:
+            lum = sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b, _a in opaque) / len(opaque)
+            bg = (11, 18, 16) if lum > 180 else (255, 255, 255)
+        else:
+            bg = (255, 255, 255)
+
+    canvas = Image.new("RGB", im.size, bg)
+    canvas.paste(im, mask=alpha)
+    out = BytesIO()
+    canvas.save(out, format="PNG", optimize=True)
+    return out.getvalue()
+
+
+async def svg_bytes_to_png(svg_bytes: bytes, *, browser=None) -> bytes:
+    """Renderiza SVG → PNG via Playwright (Chromium). Reusa `browser` se passado."""
+    from playwright.async_api import async_playwright
+
+    width, height = _svg_viewport(svg_bytes)
     b64 = base64.b64encode(svg_bytes).decode("ascii")
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -91,20 +124,28 @@ async def svg_bytes_to_png(svg_bytes: bytes) -> bytes:
   src="data:image/svg+xml;base64,{b64}" />
 </body></html>"""
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+    async def _shot(browser_obj) -> bytes:
+        page = await browser_obj.new_page(
+            viewport={"width": width + 4, "height": height + 4},
+            device_scale_factor=2,
+        )
         try:
-            page = await browser.new_page(
-                viewport={"width": width + 4, "height": height + 4},
-                device_scale_factor=2,
-            )
             await page.set_content(html, wait_until="load")
             locator = page.locator("#img")
             await locator.wait_for(state="visible", timeout=10000)
-            png = await locator.screenshot(type="png", omit_background=True)
-            return png
+            return await locator.screenshot(type="png", omit_background=True)
         finally:
-            await browser.close()
+            await page.close()
+
+    if browser is not None:
+        return await _shot(browser)
+
+    async with async_playwright() as p:
+        launched = await p.chromium.launch(headless=True)
+        try:
+            return await _shot(launched)
+        finally:
+            await launched.close()
 
 
 async def prepare_html_with_cid(html: str, *, convert_svg: bool = True) -> HtmlWithCid:
@@ -114,53 +155,76 @@ async def prepare_html_with_cid(html: str, *, convert_svg: bool = True) -> HtmlW
     O conteúdo textual do e-mail permanece o mesmo; só o transporte das imagens muda.
     """
     images: list[InlineImage] = []
-    # processa da esquerda para a direita; rebuild com offsets
     parts: list[str] = []
     last = 0
     idx = 0
+    matches = list(DATA_URI_RE.finditer(html))
+    need_svg = convert_svg and any(m.group(2).lower() == "svg+xml" for m in matches)
 
-    for match in DATA_URI_RE.finditer(html):
-        quote = match.group(1)
-        img_type = match.group(2).lower()
-        b64_payload = match.group(3)
-        parts.append(html[last : match.start()])
+    browser = None
+    playwright_cm = None
+    if need_svg:
+        from playwright.async_api import async_playwright
 
-        try:
-            raw = _decode_b64(b64_payload)
-        except Exception as exc:
-            logger.warning("inline_image_decode_failed", error=str(exc), type=img_type)
-            parts.append(match.group(0))  # mantém original
-            last = match.end()
-            continue
+        playwright_cm = async_playwright()
+        p = await playwright_cm.__aenter__()
+        browser = await p.chromium.launch(headless=True)
 
-        subtype = MIME_MAP.get(img_type, "png")
-        original = img_type
-        content = raw
+    try:
+        for match in matches:
+            quote = match.group(1)
+            img_type = match.group(2).lower()
+            b64_payload = match.group(3)
+            parts.append(html[last : match.start()])
 
-        if img_type == "svg+xml" and convert_svg:
             try:
-                content = await svg_bytes_to_png(raw)
-                subtype = "png"
-                logger.info("svg_converted_to_png", index=idx, bytes=len(content))
+                raw = _decode_b64(b64_payload)
             except Exception as exc:
-                logger.error("svg_convert_failed", error=str(exc), index=idx)
-                # tenta anexar SVG mesmo assim (poucos clientes aceitam)
-                content = raw
-                subtype = "svg+xml"
+                logger.warning("inline_image_decode_failed", error=str(exc), type=img_type)
+                parts.append(match.group(0))
+                last = match.end()
+                continue
 
-        cid = f"img{idx}"
-        images.append(
-            InlineImage(
-                cid=cid,
-                content=content,
-                subtype=subtype if subtype != "svg+xml" else "svg+xml",
-                original_type=original,
-                index=idx,
+            original = img_type
+            content = raw
+            subtype = MIME_MAP.get(img_type, "png")
+
+            if img_type == "svg+xml" and convert_svg:
+                try:
+                    content = await svg_bytes_to_png(raw, browser=browser)
+                    subtype = "png"
+                    logger.info("svg_converted_to_png", index=idx, bytes=len(content))
+                except Exception as exc:
+                    logger.error("svg_convert_failed", error=str(exc), index=idx)
+                    last = match.end()
+                    parts.append(match.group(0))
+                    continue
+
+            if subtype in {"png", "jpeg", "jpg", "gif", "webp"}:
+                try:
+                    content = flatten_png(content)
+                    subtype = "png"
+                except Exception as exc:
+                    logger.warning("png_flatten_failed", error=str(exc), index=idx)
+
+            cid = f"img{idx}@trentin.software"
+            images.append(
+                InlineImage(
+                    cid=cid,
+                    content=content,
+                    subtype=subtype,
+                    original_type=original,
+                    index=idx,
+                )
             )
-        )
-        parts.append(f"{quote}cid:{cid}{quote}")
-        idx += 1
-        last = match.end()
+            parts.append(f"{quote}cid:{cid}{quote}")
+            idx += 1
+            last = match.end()
+    finally:
+        if browser is not None:
+            await browser.close()
+        if playwright_cm is not None:
+            await playwright_cm.__aexit__(None, None, None)
 
     parts.append(html[last:])
     new_html = "".join(parts)
@@ -182,19 +246,10 @@ def build_mime_images(images: list[InlineImage]) -> list[MIMEImage]:
     """Cria partes MIMEImage com Content-ID para multipart/related."""
     parts: list[MIMEImage] = []
     for img in images:
-        subtype = img.subtype
-        if subtype == "svg+xml":
-            # MIMEImage default espera raster; usa image/svg+xml manualmente
-            from email.mime.base import MIMEBase
-            from email import encoders
-
-            part = MIMEBase("image", "svg+xml")
-            part.set_payload(img.content)
-            encoders.encode_base64(part)
-        else:
-            part = MIMEImage(img.content, _subtype=subtype)
-
+        subtype = "png" if img.subtype == "svg+xml" else img.subtype
+        part = MIMEImage(img.content, _subtype=subtype)
         part.add_header("Content-ID", f"<{img.cid}>")
-        part.add_header("Content-Disposition", "inline", filename=f"{img.cid}.{subtype.split('+')[0]}")
-        parts.append(part)  # type: ignore[arg-type]
-    return parts  # type: ignore[return-value]
+        part.add_header("Content-Disposition", "inline", filename=f"img{img.index}.{subtype}")
+        part.add_header("X-Attachment-Id", img.cid)
+        parts.append(part)
+    return parts
