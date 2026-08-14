@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     smtp_from: str = "prospeccao@trentin.com.br"
     smtp_use_tls: bool = True
 
+    # IMAP (bounces / NDR) — se vazio, reutiliza SMTP_USER/PASSWORD e
+    # deriva o host (smtppro.zoho.com → imappro.zoho.com)
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_user: str = ""
+    imap_password: str = ""
+    imap_folder: str = "INBOX"
+    imap_use_ssl: bool = True
+
     @property
     def effective_crm_url(self) -> str:
         """Prefere ESPO_CRM_URL; fallback para CRM_URL."""
@@ -60,6 +69,8 @@ class Settings(BaseSettings):
     templates_dir: str = "templates"
     api_host: str = "0.0.0.0"
     api_port: int = 8200
+    # Relativo = lg-prospector/logs. Absoluto = HD, ex. /storage/lg-prospector/logs
+    logs_dir: str = "logs"
 
     # External search APIs (opcional)
     firecrawl_api_key: str = ""  # legado; scrape é local
@@ -67,8 +78,9 @@ class Settings(BaseSettings):
     google_cse_id: str = ""
     serper_api_key: str = ""
 
-    # free = DuckDuckGo + OSM/Overpass | serper = Serper API | auto = serper se houver key
-    search_backend: str = "free"
+    # free = DuckDuckGo + OSM/Overpass | serper = só Serper (sem fallback DDG)
+    # auto = Serper se SERPER_API_KEY estiver setada, senão free
+    search_backend: str = "auto"
 
     # Scraping local (substitui Firecrawl)
     scrape_use_playwright: bool = True
@@ -105,10 +117,21 @@ class Settings(BaseSettings):
 
     # Dispatch e-mail
     email_cooldown_days: int = 4  # não reenviar pro mesmo endereço em menos de N dias
-    dispatch_delay_seconds: float = 2.0
+    # 8s entre e-mails; 0 = sem teto horário/diário (pausa de 1 min é entre fluxos)
+    dispatch_delay_seconds: float = 8.0
+    dispatch_delay_jitter_seconds: float = 0.0
+    email_hourly_limit: int = 0
+    email_daily_limit: int = 0
+
+    # Mailman — disparo separado da prospecção (2 e-mails, pausa 2–5 min)
+    mailman_batch_size: int = 2
+    mailman_interval_min_seconds: float = 120.0
+    mailman_interval_max_seconds: float = 300.0
+    mailman_intra_batch_min_seconds: float = 20.0
+    mailman_intra_batch_max_seconds: float = 75.0
 
     # Rate limiting (dispatch / API)
-    rate_limit_requests: int = 60
+    rate_limit_requests: int = 10
     rate_limit_window_seconds: int = 60
 
     @computed_field  # type: ignore[prop-decorator]
