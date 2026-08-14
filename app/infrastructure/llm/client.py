@@ -54,6 +54,12 @@ _NICHE_RULES: dict[str, str] = {
         "KEEP: deputado, senador, vereador, gabinete, partido/diretório, comissão com contato. "
         "DROP: notícia genérica sem pessoa/órgão, meme, fórum."
     ),
+    "generalista": (
+        "KEEP: qualquer negócio brasileiro ativo (comércio, serviço, indústria, clínica, "
+        "loja, oficina, restaurante, escritório, PME) E também órgão público "
+        ".gov.br / .leg.br / .jus.br (prefeitura, câmara, tribunal) que possa cotar. "
+        "DROP: vaga de emprego, listicle, wiki, empresa estrangeira."
+    ),
 }
 
 _SYSTEM = (
@@ -119,7 +125,8 @@ def _build_score_prompt(
         f"snippet={ (snippet or '')[:220] }\n"
         f"regras_nicho: {_niche_rules(niche)}\n"
         "DROP sempre: wikipedia, dicio, significados, blog educativo, download, "
-        "agência bancária (BB/Itaú/Caixa) se nicho≠banco, gov.br genérico (exceto político).\n"
+        "agência bancária (BB/Itaú/Caixa) se nicho≠banco. "
+        "gov.br: DROP nos nichos (exceto generalista e político).\n"
         "Resposta JSON exata com chaves:\n"
         '{"score":0-100,"keep":true|false,"reason":"max 12 palavras",'
         '"clean_name":"nome limpo da empresa ou vazio",'
@@ -207,6 +214,94 @@ async def score_company_candidate(
             "keep": True,
             "reason": f"llm_error:{type(exc).__name__}",
             "clean_name": name or "",
+            "confidence": "low",
+            "error": str(exc)[:200],
+        }
+
+
+async def score_email_belongs_to_business(
+    *,
+    email: str,
+    name: str = "",
+    website: str = "",
+    city: str = "",
+    segment: str = "",
+    snippet: str = "",
+    force: bool = False,
+) -> dict[str, Any]:
+    """Qwen local: este e-mail genérico (.com/.gmail/…) é contato da empresa BR?
+
+    KEEP se for plausível (PME usa Gmail; empresa BR usa .com/.net/.org).
+    DROP se for outra pessoa, outro país, diretório ou sem vínculo.
+    Sem LLM / erro → keep=True (não bloqueia a caçada).
+    """
+    settings = get_settings()
+    if not force and not settings.hunt_use_llm:
+        return {
+            "score": 50,
+            "keep": True,
+            "reason": "llm_disabled",
+            "confidence": "low",
+        }
+
+    prompt = (
+        "Decida se este E-MAIL é um contato comercial plausível desta empresa brasileira.\n"
+        f"empresa={ (name or '')[:140] }\n"
+        f"cidade={ (city or '')[:60] }\n"
+        f"site={ (website or '')[:160] }\n"
+        f"email={ (email or '')[:80] }\n"
+        f"nicho={segment or 'generalista'}\n"
+        f"snippet={ (snippet or '')[:180] }\n"
+        "KEEP: e-mail da empresa (contato@, comercial@) OU gmail/hotmail/outlook "
+        "de dono/equipe se o nome bate ou é PME brasileira comum; "
+        ".com/.net/.org de empresa BR é normal.\n"
+        "DROP: outra pessoa/país sem relação; diretório/vagas/jornal; "
+        "e-mail inventado no SERP. "
+        "No nicho generalista KEEP e-mail .gov.br/.leg.br/.jus.br (órgão pode cotar).\n"
+        "Resposta JSON exata:\n"
+        '{"score":0-100,"keep":true|false,"reason":"max 12 palavras",'
+        '"confidence":"high|medium|low"}'
+    )
+    try:
+        raw = await chat_completion(
+            [
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max(80, min(120, settings.llm_max_tokens)),
+        )
+        data = _parse_json(raw)
+        score = max(0, min(100, int(data.get("score", 50))))
+        keep = data.get("keep")
+        if keep is None:
+            keep = score >= 50
+        else:
+            keep = bool(keep)
+        reason = str(data.get("reason") or "")[:120]
+        confidence = str(data.get("confidence") or "medium").lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "medium"
+        logger.info(
+            "llm_score_email",
+            email=(email or "")[:60],
+            name=(name or "")[:40],
+            score=score,
+            keep=keep,
+            reason=reason,
+        )
+        return {
+            "score": score,
+            "keep": keep,
+            "reason": reason,
+            "confidence": confidence,
+            "raw": raw[:300],
+        }
+    except Exception as exc:
+        logger.warning("llm_score_email_failed", error=str(exc), email=(email or "")[:60])
+        return {
+            "score": 50,
+            "keep": True,
+            "reason": f"llm_error:{type(exc).__name__}",
             "confidence": "low",
             "error": str(exc)[:200],
         }

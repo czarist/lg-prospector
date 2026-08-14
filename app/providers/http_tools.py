@@ -15,6 +15,17 @@ from app.providers.search_free import free_search
 
 logger = get_logger(__name__)
 
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+class _RetryableSerper(Exception):
+    """5xx / 429 — vale retry. 4xx permanente não entra aqui."""
+
+
+def _serper_key() -> str:
+    settings = get_settings()
+    return (settings.serper_api_key or "").strip().strip('"').strip("'")
+
 
 def _resolve_backend() -> str:
     """
@@ -23,39 +34,80 @@ def _resolve_backend() -> str:
     """
     settings = get_settings()
     backend = (getattr(settings, "search_backend", None) or "auto").lower().strip()
+    key = _serper_key()
     if backend == "auto":
-        return "serper" if settings.serper_api_key else "free"
-    if backend in {"free", "serper"}:
-        return backend
-    return "free"
+        return "serper" if key else "free"
+    if backend == "serper":
+        return "serper"
+    if backend == "free":
+        return "free"
+    return "serper" if key else "free"
+
+
+def _extract_serper_hits(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    for key in ("organic", "places", "news"):
+        hits = data.get(key)
+        if isinstance(hits, list) and hits:
+            out: list[dict[str, Any]] = []
+            for item in hits:
+                if isinstance(item, dict):
+                    row = dict(item)
+                    row.setdefault("source", "serper")
+                    out.append(row)
+            return out
+    return []
 
 
 async def serper_search_raw(
     query: str, num: int = 10, search_type: str = "search"
 ) -> list[dict[str, Any]]:
-    """Busca via Serper.dev (requer SERPER_API_KEY)."""
-    settings = get_settings()
-    if not settings.serper_api_key:
+    """Busca via Serper.dev (requer SERPER_API_KEY). Sem fallback."""
+    key = _serper_key()
+    if not key:
+        logger.error("serper_missing_key", query=query[:80], search_type=search_type)
         return []
 
     url = f"https://google.serper.dev/{search_type}"
-    headers = {"X-API-KEY": settings.serper_api_key, "Content-Type": "application/json"}
-    payload = {"q": query, "num": num, "gl": "br", "hl": "pt-br"}
+    headers = {"X-API-KEY": key, "Content-Type": "application/json"}
+    payload = {"q": query, "num": max(1, min(int(num or 10), 100)), "gl": "br", "hl": "pt-br"}
 
     async def _do():
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
+            if resp.status_code in _RETRYABLE_STATUS:
+                raise _RetryableSerper(
+                    f"status={resp.status_code} body={resp.text[:200]}"
+                )
+            if resp.status_code >= 400:
+                logger.error(
+                    "serper_http_error",
+                    status=resp.status_code,
+                    body=resp.text[:300],
+                    query=query[:80],
+                    search_type=search_type,
+                )
+                return []
             return resp.json()
 
     try:
-        data = await async_retry(_do, attempts=2, exceptions=(httpx.HTTPError,))
+        data = await async_retry(
+            _do, attempts=2, exceptions=(_RetryableSerper, httpx.TransportError)
+        )
     except Exception as exc:
-        logger.error("serper_error", error=str(exc), query=query)
+        logger.error("serper_error", error=str(exc), query=query[:80], search_type=search_type)
         return []
 
-    organic = data.get("organic") or data.get("places") or data.get("news") or []
-    return organic if isinstance(organic, list) else []
+    hits = _extract_serper_hits(data)
+    logger.info(
+        "serper_ok",
+        query=query[:80],
+        search_type=search_type,
+        count=len(hits),
+        credits=(data.get("credits") if isinstance(data, dict) else None),
+    )
+    return hits
 
 
 async def web_search(
@@ -71,8 +123,8 @@ async def web_search(
 
     SEARCH_BACKEND=auto|free|serper
     - free: DuckDuckGo + Overpass/OSM
-    - serper: Serper (se sem key, cai no free)
-    - auto: Serper se houver key, senão free
+    - serper: só Serper. Sem key / erro / vazio → lista vazia (não cai no DDG).
+    - auto: Serper se houver key, senão free. Com key também não cai no DDG.
     """
     backend = _resolve_backend()
     logger.info(
@@ -82,16 +134,11 @@ async def web_search(
         query=query[:80],
         city=city or None,
         state=state or None,
+        serper_key=bool(_serper_key()),
     )
 
     if backend == "serper":
-        results = await serper_search_raw(query, num=num, search_type=search_type)
-        if results:
-            return results
-        logger.warning("serper_empty_fallback_free", query=query)
-        return await free_search(
-            query, num=num, search_type=search_type, city=city, state=state
-        )
+        return await serper_search_raw(query, num=num, search_type=search_type)
 
     return await free_search(
         query, num=num, search_type=search_type, city=city, state=state

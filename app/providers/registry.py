@@ -8,11 +8,13 @@ from app.domain.interfaces.provider import BaseProvider
 from app.providers.advogados import AdvogadosProvider
 from app.providers.agencias_marketing import AgenciasMarketingProvider
 from app.providers.empresas_ti import EmpresasTIProvider
+from app.providers.generalista import GeneralistaProvider
 from app.providers.grupos_midiaticos import GruposMidiaticosProvider
 from app.providers.politicos import PoliticosProvider
 from app.providers.prestadores import PrestadoresProvider
 
-# Mapeamento canônico niche → template (6 nichos)
+# Mapeamento canônico niche → template
+# generalista NÃO entra no hunt_loop de nicho (DEFAULT_NICHES)
 NICHE_TEMPLATES: dict[str, str] = {
     "advogado": "email-prospeccao-advogados.html",
     "agencia_marketing": "email-prospeccao-agencias.html",
@@ -20,6 +22,7 @@ NICHE_TEMPLATES: dict[str, str] = {
     "prestador_servico": "email-prospeccao-prestadores.html",
     "grupo_midiatico": "email-prospeccao-jornalismo.html",
     "politico": "email-prospeccao-politicos.html",
+    "generalista": "email-prospeccao-generalista.html",
 }
 
 # Aliases → nicho canônico (partido = politico)
@@ -49,6 +52,7 @@ class ProviderRegistry:
             PrestadoresProvider(),
             GruposMidiaticosProvider(),
             PoliticosProvider(),
+            GeneralistaProvider(),
         ):
             self.register(provider)
 

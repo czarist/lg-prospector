@@ -25,13 +25,31 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+# Listing sites (imobiliárias etc.) dump 5MB+ of minified HTML. The old
+# `[a-z0-9.\-]+\.[a-z]{2,}` domain group backtracks explosively on that.
+# Bounds keep matching linear.
+MAX_HTML_CHARS = 750_000
+MAX_EXTRACT_CHARS = 400_000
+
 EMAIL_RE = re.compile(
-    r"(?:mailto:)?([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})",
+    r"(?:mailto:)?"
+    r"("
+    r"[a-zA-Z0-9_%+\-]{1,64}(?:\.[a-zA-Z0-9_%+\-]{1,63}){0,8}"
+    r"@"
+    r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.){1,8}"
+    r"[A-Za-z]{2,24}"
+    r")",
     re.IGNORECASE,
 )
 PHONE_RE = re.compile(
     r"(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9?\d{4}[-\s.]?\d{4})"
 )
+
+
+def _clip(text: str, limit: int) -> str:
+    if text and len(text) > limit:
+        return text[:limit]
+    return text or ""
 
 # E-mails de tracking/CDN/lixo
 EMAIL_BLOCKLIST_SUBSTR = (
@@ -46,6 +64,23 @@ EMAIL_BLOCKLIST_SUBSTR = (
     "gstatic.com",
     "cloudflare.com",
     "github.com",
+    "facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "nameberry.com",
+    "behindthename.com",
+    "dailymotion.com",
+    "juridicocerto.com",
+    "previdenciarista.com",
+    "lawzana.com",
+    "ohub.com.br",
+    "econodata.com.br",
+    "canaldoanuncio.com",
+    "contaazul.com",
+    "indeed.com",
+    "infojobs.com.br",
+    "catho.com.br",
+    "glassdoor.com",
     "placeholder",
     "domain.com",
     "email.com",
@@ -144,6 +179,8 @@ def is_valid_email(email: str) -> bool:
     local, _, domain = email.partition("@")
     if not local or not domain or "." not in domain:
         return False
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return False
     if any(x in email for x in EMAIL_BLOCKLIST_SUBSTR):
         return False
     # Heurística: imagem ofuscada "nome [at] dom"
@@ -173,7 +210,7 @@ def score_email(email: str, site_host: str = "") -> int:
 
 
 def extract_emails(text: str, site_host: str = "") -> list[str]:
-    found = EMAIL_RE.findall(text or "")
+    found = EMAIL_RE.findall(_clip(text, MAX_EXTRACT_CHARS * 2))
     cleaned: list[str] = []
     seen: set[str] = set()
     for raw in found:
@@ -191,7 +228,7 @@ def extract_emails(text: str, site_host: str = "") -> list[str]:
 
 
 def extract_phones(text: str) -> list[str]:
-    found = PHONE_RE.findall(text or "")
+    found = PHONE_RE.findall(_clip(text, MAX_EXTRACT_CHARS))
     cleaned: list[str] = []
     seen: set[str] = set()
     for p in found:
@@ -212,7 +249,7 @@ def extract_phones(text: str) -> list[str]:
 
 def extract_contact_links(html: str, base_url: str, max_links: int = 8) -> list[str]:
     """Descobre URLs internas de contato a partir do HTML."""
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(_clip(html, MAX_HTML_CHARS), "lxml")
     links: list[str] = []
     seen: set[str] = set()
 
@@ -240,15 +277,21 @@ def extract_contact_links(html: str, base_url: str, max_links: int = 8) -> list[
 
 
 def html_to_text(html: str) -> str:
+    html = _clip(html, MAX_HTML_CHARS)
     soup = BeautifulSoup(html, "lxml")
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
     text = soup.get_text("\n", strip=True)
-    # Mantém também hrefs mailto e raw HTML para regex pegar e-mails ofuscados em attrs
+    # Hrefs mailto + um pedaço do HTML cru (não o dump inteiro — regex explode).
     attrs_blob = " ".join(
         str(v) for tag in soup.find_all(True) for v in (tag.attrs or {}).values() if isinstance(v, str)
     )
-    return f"{text}\n{attrs_blob}\n{html}"
+    return f"{text}\n{attrs_blob}\n{_clip(html, MAX_EXTRACT_CHARS)}"
+
+
+def _extract_from_html(html: str, host: str) -> tuple[str, list[str], list[str]]:
+    text = html_to_text(html)
+    return text, extract_emails(text, site_host=host), extract_phones(text)
 
 
 async def fetch_httpx(url: str, timeout: float = 20.0) -> Optional[str]:
@@ -264,11 +307,15 @@ async def fetch_httpx(url: str, timeout: float = 20.0) -> Optional[str]:
                 logger.debug("scrape_http_status", url=url, status=resp.status_code)
                 return None
             ctype = (resp.headers.get("content-type") or "").lower()
+            body = resp.text
             if "html" not in ctype and "text" not in ctype and "xml" not in ctype:
                 # ainda tenta se body parecer HTML
-                if not resp.text.lstrip().lower().startswith(("<!doctype", "<html")):
+                if not body.lstrip().lower().startswith(("<!doctype", "<html")):
                     return None
-            return resp.text
+            if len(body) > MAX_HTML_CHARS:
+                logger.info("scrape_html_truncated", url=url, chars=len(body))
+                body = body[:MAX_HTML_CHARS]
+            return body
     except Exception as exc:
         logger.debug("scrape_httpx_failed", url=url, error=str(exc))
         return None
@@ -345,9 +392,19 @@ async def scrape_website(
     async def process_html(page_url: str, html: str, method: str) -> None:
         methods.add(method)
         visited.append(page_url)
-        text = html_to_text(html)
-        all_emails.extend(extract_emails(text, site_host=host))
-        all_phones.extend(extract_phones(text))
+        if len(html) > MAX_HTML_CHARS:
+            logger.info("scrape_html_truncated", url=page_url, chars=len(html))
+            html = html[:MAX_HTML_CHARS]
+        try:
+            text, emails, phones = await asyncio.wait_for(
+                asyncio.to_thread(_extract_from_html, html, host),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("scrape_extract_timeout", url=page_url, chars=len(html))
+            return
+        all_emails.extend(emails)
+        all_phones.extend(phones)
         if not result.raw_text_sample:
             result.raw_text_sample = text[:500]
 
