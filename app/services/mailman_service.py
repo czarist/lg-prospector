@@ -129,10 +129,13 @@ class MailmanService:
             cooldown_days=cooldown,
             wait_days=wait,
             only=only,
-            overfetch=max(24, size * 16),
+            overfetch=max(80, size * 40),
+            persist_rejects=not dry_run,
         )
         require_pair = only is None and size >= 2
         picked = self.pick_batch(pool, size, require_pair=require_pair)
+        niche_n = sum(1 for t in pool if t.lane == "niche")
+        gen_n = sum(1 for t in pool if t.lane == "generalista")
         results: list[dict[str, Any]] = []
         sent = failed = skipped = 0
         provider_blocked = False
@@ -219,6 +222,8 @@ class MailmanService:
             "failed": failed,
             "skipped": skipped,
             "candidates": len(pool),
+            "niche": niche_n,
+            "generalista": gen_n,
             "picked": len(picked),
             "quota_paused": False,
             "provider_blocked": provider_blocked,
@@ -232,6 +237,8 @@ class MailmanService:
             failed=failed,
             skipped=skipped,
             candidates=len(pool),
+            niche=niche_n,
+            generalista=gen_n,
             picked=len(picked),
             blocked=provider_blocked,
         )
@@ -254,7 +261,7 @@ class MailmanService:
             cooldown_days=cooldown,
             wait_days=wait,
             only=only,
-            overfetch=max(limit * 3, 40),
+            overfetch=max(limit * 3, 80),
         )
         niche_n = sum(1 for t in pool if t.lane == "niche")
         gen_n = sum(1 for t in pool if t.lane == "generalista")
@@ -284,15 +291,25 @@ class MailmanService:
         wait_days: int,
         only: Lane | None,
         overfetch: int,
+        persist_rejects: bool = False,
     ) -> list[MailTarget]:
         half = max(8, overfetch // 2)
         targets: list[MailTarget] = []
         if only != "generalista":
-            targets.extend(await self._niche_targets(cooldown_days=cooldown_days, limit=half))
+            targets.extend(
+                await self._niche_targets(
+                    cooldown_days=cooldown_days,
+                    limit=half,
+                    persist_rejects=persist_rejects,
+                )
+            )
         if only != "niche":
             targets.extend(
                 await self._generalist_targets(
-                    cooldown_days=cooldown_days, wait_days=wait_days, limit=max(40, half)
+                    cooldown_days=cooldown_days,
+                    wait_days=wait_days,
+                    limit=max(40, half),
+                    persist_rejects=persist_rejects,
                 )
             )
         # cooldown global (qualquer template). Mesmo e-mail pode aparecer
@@ -459,49 +476,88 @@ class MailmanService:
     # ------------------------------------------------------------------
     # coleta
     # ------------------------------------------------------------------
-    async def _niche_targets(self, *, cooldown_days: int, limit: int) -> list[MailTarget]:
+    async def _niche_targets(
+        self,
+        *,
+        cooldown_days: int,
+        limit: int,
+        persist_rejects: bool = False,
+    ) -> list[MailTarget]:
+        """Page past junk/cooldown-clogged rows until `limit` usable niche targets."""
         recent = self._recent_email_exists(cooldown_days)
-        q = (
-            select(CampaignItem)
-            .join(Campaign, CampaignItem.campaign_id == Campaign.id)
-            .join(Contact, CampaignItem.contact_id == Contact.id)
-            .outerjoin(Company, CampaignItem.company_id == Company.id)
-            .where(
-                CampaignItem.stage == ItemStageStatus.CRM_SYNCED.value,
-                func.lower(Campaign.niche) != GENERALIST_NICHE,
-                Contact.email.is_not(None),
-                Contact.email != "",
-                ~recent,
-            )
-            .options(
-                selectinload(CampaignItem.company),
-                selectinload(CampaignItem.contact),
-                selectinload(CampaignItem.campaign),
-            )
-            .order_by(CampaignItem.created_at.asc())
-            .limit(limit)
-        )
-        items = list((await self.session.execute(q)).scalars().unique().all())
         out: list[MailTarget] = []
-        for item in items:
-            target = self._niche_from_item(item)
-            if target and self._passes_common_filters(target):
+        rejects: list[CampaignItem] = []
+        offset = 0
+        page = 80
+        scanned = 0
+        max_scan = 600
+        while len(out) < limit and scanned < max_scan:
+            q = (
+                select(CampaignItem)
+                .join(Campaign, CampaignItem.campaign_id == Campaign.id)
+                .join(Contact, CampaignItem.contact_id == Contact.id)
+                .outerjoin(Company, CampaignItem.company_id == Company.id)
+                .where(
+                    CampaignItem.stage == ItemStageStatus.CRM_SYNCED.value,
+                    func.lower(Campaign.niche) != GENERALIST_NICHE,
+                    Contact.email.is_not(None),
+                    Contact.email != "",
+                    ~recent,
+                )
+                .options(
+                    selectinload(CampaignItem.company),
+                    selectinload(CampaignItem.contact),
+                    selectinload(CampaignItem.campaign),
+                )
+                .order_by(CampaignItem.created_at.asc())
+                .offset(offset)
+                .limit(page)
+            )
+            items = list((await self.session.execute(q)).scalars().unique().all())
+            if not items:
+                break
+            offset += len(items)
+            scanned += len(items)
+            for item in items:
+                target = self._niche_from_item(item)
+                if not target:
+                    continue
+                why = self._reject_reason(target)
+                if why:
+                    if persist_rejects and why.startswith(("orgao_publico", "email_implausivel")):
+                        rejects.append(item)
+                        item.error_message = why
+                    continue
                 out.append(target)
+                if len(out) >= limit:
+                    break
+        if persist_rejects and rejects:
+            for item in rejects:
+                item.stage = ItemStageStatus.FAILED.value
+                item.status = ItemStatus.FAILED.value
+            await self.session.flush()
+            logger.info("mailman_rejected_niche", n=len(rejects))
         return out
 
     async def _generalist_targets(
-        self, *, cooldown_days: int, wait_days: int, limit: int
+        self,
+        *,
+        cooldown_days: int,
+        wait_days: int,
+        limit: int,
+        persist_rejects: bool = False,
     ) -> list[MailTarget]:
         half = max(4, limit // 2)
         out: list[MailTarget] = []
-        contacts = await self.gen_svc._eligible_existing_contacts(limit=max(40, half * 3))
+        contacts = await self.gen_svc._eligible_existing_contacts(limit=max(80, half * 6))
         for ct in contacts:
             target = self._from_contact(ct, lane="generalista", item=None)
             if target and self._passes_common_filters(target):
                 out.append(target)
 
         cutoff = _utcnow() - timedelta(days=max(0, wait_days))
-        items = await self.gen_svc._mature_generalist_items(cutoff, limit=max(20, half))
+        items = await self.gen_svc._mature_generalist_items(cutoff, limit=max(40, half * 3))
+        rejects: list[CampaignItem] = []
         for item in items:
             if not item.contact:
                 continue
@@ -511,8 +567,21 @@ class MailmanService:
                 item=item,
                 company=item.company,
             )
-            if target and self._passes_common_filters(target):
-                out.append(target)
+            if not target:
+                continue
+            why = self._reject_reason(target)
+            if why:
+                if persist_rejects and why.startswith(("orgao_publico", "email_implausivel")):
+                    rejects.append(item)
+                    item.error_message = why
+                continue
+            out.append(target)
+        if persist_rejects and rejects:
+            for item in rejects:
+                item.stage = ItemStageStatus.FAILED.value
+                item.status = ItemStatus.FAILED.value
+            await self.session.flush()
+            logger.info("mailman_rejected_generalista", n=len(rejects))
         return out
 
     def _recent_email_exists(self, cooldown_days: int):
@@ -577,16 +646,16 @@ class MailmanService:
             domain=_email_domain(email),
         )
 
-    def _passes_common_filters(self, target: MailTarget) -> bool:
+    def _reject_reason(self, target: MailTarget) -> str | None:
         extra_c = target.contact.extra or {}
         extra_co = (target.company.extra if target.company else None) or {}
         if extra_c.get("opt_out") or extra_co.get("opt_out"):
-            return False
+            return "opt_out"
         if extra_c.get("negociacao_ativa") or extra_co.get("negociacao_ativa"):
-            return False
+            return "negociacao_ativa"
         seg = ((target.company.segment if target.company else "") or target.niche or "").lower()
         if target.lane == "generalista" and seg in _EXCLUDED_SEGMENTS:
-            return False
+            return "segmento_excluido"
         judge_seg = GENERALIST_NICHE if target.lane == "generalista" else (seg or target.niche)
         allow_gov = target.lane == "generalista"
         if is_public_email(target.email, allow_gov_br=allow_gov) or is_public_organ(
@@ -596,7 +665,7 @@ class MailmanService:
             segment=judge_seg,
             allow_gov_br=allow_gov,
         ):
-            return False
+            return "orgao_publico"
         if target.lane == "generalista" and target.company and not is_plausible_lead(
             name=target.company.name or "",
             website=target.company.website or "",
@@ -604,8 +673,8 @@ class MailmanService:
             snippet=str(extra_co.get("snippet") or ""),
             segment=GENERALIST_NICHE,
         ):
-            return False
-        ok_geo, _reason = classify_contact_email(
+            return "fora_do_nicho_ou_nacionalidade"
+        ok_geo, reason = classify_contact_email(
             target.email,
             name=target.contact.name or (target.company.name if target.company else "") or "",
             city=target.city,
@@ -613,4 +682,9 @@ class MailmanService:
             website=(target.company.website if target.company else "") or "",
             segment=judge_seg,
         )
-        return bool(ok_geo)
+        if not ok_geo:
+            return f"email_implausivel:{reason}"
+        return None
+
+    def _passes_common_filters(self, target: MailTarget) -> bool:
+        return self._reject_reason(target) is None

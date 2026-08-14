@@ -465,7 +465,20 @@ def _snapshot() -> dict[str, Any]:
                     "overtime": False,
                     "eta_cycle": None,
                     "avg": _AVG_MAIL_GAP,
-                    "detail": f"fila {live.get('candidates') if live.get('candidates') is not None else '—'}",
+                    "detail": (
+                        f"sem par  nicho {live.get('niche_n', '—')}  "
+                        f"gen {live.get('gen_n', '—')}"
+                        if live.get("picked") == 0
+                        and (live.get("niche_n") is not None or live.get("gen_n") is not None)
+                        else (
+                            f"fila {live.get('candidates') if live.get('candidates') is not None else '—'}"
+                            + (
+                                f"  nicho {live.get('niche_n')}  gen {live.get('gen_n')}"
+                                if live.get("niche_n") is not None
+                                else ""
+                            )
+                        )
+                    ),
                     "last": (
                         f"enviados {live.get('sent_total') or 0}  "
                         f"falha {live.get('failed_total') or 0}  "

@@ -124,7 +124,9 @@ def _print_batch(batch_n: int, result: dict[str, Any]) -> None:
     _echo(
         f"  lote {batch_n}: enviados={result.get('sent', 0)} "
         f"falhas={result.get('failed', 0)} pulados={result.get('skipped', 0)} "
-        f"fila={result.get('candidates', 0)} escolhidos={result.get('picked', 0)}"
+        f"fila={result.get('candidates', 0)} "
+        f"nicho={result.get('niche', '?')} gen={result.get('generalista', '?')} "
+        f"escolhidos={result.get('picked', 0)}"
     )
     for row in result.get("results") or []:
         mark = "✓" if row.get("outcome") in {"sent", "dry_run"} else "·"
@@ -332,6 +334,8 @@ async def main() -> None:
                     "sent_total": sent_total + sent_n,
                     "failed_total": failed_total + int(result.get("failed") or 0),
                     "candidates": result.get("candidates"),
+                    "niche_n": result.get("niche"),
+                    "gen_n": result.get("generalista"),
                     "picked": result.get("picked"),
                     "last_line": last_line,
                 },
@@ -343,6 +347,8 @@ async def main() -> None:
                 "failed",
                 "skipped",
                 "candidates",
+                "niche",
+                "generalista",
                 "picked",
                 "provider_blocked",
             )
@@ -368,7 +374,11 @@ async def main() -> None:
             empty = int(result.get("picked") or 0) == 0
             if empty:
                 wait = max(15.0, float(args.empty_wait))
-                _echo(f"  fila vazia — aguardando {wait:.0f}s…")
+                _echo(
+                    f"  sem par — nicho={result.get('niche', 0)} "
+                    f"generalista={result.get('generalista', 0)} "
+                    f"— aguardando {wait:.0f}s…"
+                )
             else:
                 wait = _random_interval(args.min_interval, args.max_interval)
                 _echo(f"  pausa {wait:.0f}s até o próximo lote…")
