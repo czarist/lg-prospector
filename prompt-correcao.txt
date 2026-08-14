@@ -1,0 +1,41 @@
+# === Correção / revisão de leads ===
+# Dry-run primeiro. Só --apply grava (CRM e/ou banco).
+# Antes de excluir, o Qwen local avalia e-mail gratuito
+# (Gmail, Hotmail, Outlook, Yahoo, UOL, Bol, iCloud…)
+# e domínio genérico (.com / .net / .org, inclusive hotmail.com.br).
+
+# --- Purge nicho / nacionalidade (relatório; não grava) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py
+
+# só um nicho / cidade / recorte
+# PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py --niche politico
+# PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py --city "São Paulo" --since-days 14
+# PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py --quiet
+
+# sem Qwen (mais rápido; pode marcar Gmail/Hotmail/.com válidos para exclusão)
+# PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py --skip-llm --quiet
+
+# --- Purge (GRAVA: apaga EspoCRM + banco local) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py --apply
+
+# --- Purge só banco local (não toca o Espo) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/purge_bad_leads.py --apply --skip-crm
+
+# --- Revisão de qualidade (relatório; não grava) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/review_data_quality.py \
+  --stages crm_synced,sent -n 1500
+
+# --- Bounces SMTP (dry-run; não grava) ---
+# Zoho: imappro.zoho.com se SMTP_HOST=smtppro.zoho.com (auto se IMAP_* vazio)
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/review_bounces.py \
+  --since-days 30 --check-domain -v
+
+# --- Bounces SMTP (GRAVA no banco: status=bounced) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/review_bounces.py \
+  --since-days 30 --check-domain --apply

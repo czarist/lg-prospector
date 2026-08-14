@@ -77,6 +77,18 @@ python scripts/review_leads_llm.py -n 40
 python scripts/review_leads_llm.py --niche agencia_marketing -n 20 --apply-discard
 ```
 
+### Um comando (painel)
+
+Sobe nicho, generalista e mailman e abre o acompanhamento no terminal:
+
+```bash
+./cockpit          # sobe o que faltar + painel
+./cockpit --attach # só o painel
+./cockpit --stop   # encerra os três
+```
+
+`q` fecha o painel. Os processos continuam.
+
 ### Loop contínuo (escada de cidades)
 
 Busca **5 leads × nicho × cidade**, priorizando capitais e polos econômicos (foco **RS**). Não usa município pequeno.
@@ -85,14 +97,8 @@ Busca **5 leads × nicho × cidade**, priorizando capitais e polos econômicos (
 # ver fila (sem gastar API)
 python scripts/hunt_loop.py --plan-only --focus-rs --max-tier 2
 
-# só Rio Grande do Sul, uma volta (prospecta + dispara e-mail)
+# só Rio Grande do Sul, uma volta (só prospecta)
 python scripts/hunt_loop.py --only-rs --once -n 5
-
-# dry-run de e-mail (não envia SMTP)
-python scripts/hunt_loop.py --only-rs --once -n 5 --dry-run-dispatch
-
-# sem disparo
-python scripts/hunt_loop.py --only-rs --once --no-dispatch
 
 # loop contínuo (retoma de logs/hunt_loop_state.json)
 python scripts/hunt_loop.py --focus-rs --max-tier 2 -n 5 --pause 8
@@ -101,12 +107,45 @@ python scripts/hunt_loop.py --focus-rs --max-tier 2 -n 5 --pause 8
 python scripts/hunt_loop.py --only-capitals --once
 ```
 
-Fluxo por job: **discover → enrich → CRM → dispatch** (template HTML do nicho, 1 e-mail por contato).  
-**Cooldowno 4 dias:** o mesmo endereço não recebe de novo em menos de `EMAIL_COOLDOWN_DAYS` (default 4).
+Fluxo por job: **discover → enrich → CRM**. O disparo saiu do hunt — rode o **mailman** em paralelo.
 
-### Logs (para analisar no dia seguinte)
+### Mailman (disparo)
 
-Em `logs/hunt/`:
+Processo separado: avalia quem **não recebeu e-mail nos últimos 4 dias** e envia **1 nicho + 1 generalista** por lote. Sem os dois, espera. Pausa aleatória de **2–5 minutos**.
+
+```bash
+# loop contínuo
+python scripts/mailman.py
+
+# um lote
+python scripts/mailman.py --once
+
+# ver fila sem enviar
+python scripts/mailman.py --plan
+
+# dry-run (não envia SMTP)
+python scripts/mailman.py --dry-run --once
+```
+
+**Cooldown 4 dias:** o mesmo endereço não recebe de novo em menos de `EMAIL_COOLDOWN_DAYS` (default 4).  
+Lead generalista novo só entra na fila depois de 4 dias do cadastro.
+
+### Logs
+
+Default: `logs/` no projeto. Para gravar no HD, no `.env`:
+
+```
+LOGS_DIR=/storage/lg-prospector/logs
+```
+
+Migração (cria a pasta, copia, troca por symlink):
+
+```bash
+./scripts/move_logs_to_hdd.sh
+./cockpit
+```
+
+Em `LOGS_DIR/hunt/` (ou `logs/hunt/`):
 
 | Arquivo | Conteúdo |
 |---------|----------|
@@ -127,10 +166,11 @@ Ordem da escadinha: **Porto Alegre → outras capitais → polos gaúchos (Caxia
 
 ## Pipeline em etapas
 
-Pesquisa e disparo são **segmentados** (não rodam tudo de uma vez):
+Pesquisa e disparo são **segmentados** (não rodam tudo de uma vez). Hunt para em `crm`; o mailman envia depois:
 
 ```
-created → discover → enrich → crm → dispatch → done
+created → discover → enrich → crm        # hunt
+                         ↘ mailman → sent
 ```
 
 | Etapa | O que faz |

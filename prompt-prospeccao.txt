@@ -1,0 +1,104 @@
+# === TUDO JUNTO (nicho + generalista + mailman + painel) ===
+cd /home/lucas/lg-prospector && ./cockpit
+
+# só o painel (processos já no ar)
+./cockpit --attach
+
+# encerra os três
+./cockpit --stop
+
+# === Prospecção (contínua) — NÃO dispara e-mail ===
+# Ctrl+C encerra após o job atual. Estado: logs/hunt_loop_state.json
+# Cada ciclo busca leads NOVOS e ignora empresa já cadastrada.
+# Bater a cota N não encerra o nicho×cidade — a próxima volta muda a query.
+# --skip-completed volta ao modo escada (uma vez por par).
+# --max-partial-attempts 5 só conta tentativa fraca; sem --skip-completed não para.
+# Disparo: scripts/mailman.py (em paralelo).
+
+# --- HUNT (escada atual) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
+  --focus-rs \
+  --max-tier 3 \
+  --min-pop-k 50 \
+  -n 10 \
+  --stages discover,enrich,crm \
+  --pause 8 \
+  --cycle-pause 60 \
+  --max-partial-attempts 5
+
+# --- AMPLIAR (só RS, cidades ~30k+) — use se a fila acima estiver completa ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
+  --focus-rs --only-rs \
+  --max-tier 3 \
+  --min-pop-k 30 \
+  -n 10 \
+  --stages discover,enrich,crm \
+  --pause 8 \
+  --cycle-pause 60 \
+  --max-partial-attempts 5
+
+# --- REFAZER TUDO (ignora completed no state) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
+  --focus-rs \
+  --max-tier 3 \
+  --min-pop-k 50 \
+  -n 10 \
+  --stages discover,enrich,crm \
+  --pause 8 \
+  --cycle-pause 60 \
+  --max-partial-attempts 5 \
+  --redo
+
+# --- SÓ PLANEJAR A FILA (não roda jobs) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
+  --focus-rs --max-tier 3 --min-pop-k 50 -n 10 --plan-only
+
+# === Prospecção GENERALISTA (independente dos nichos) — NÃO dispara ===
+# Só descobre, analisa e cadastra. Novos leads origin=prospeccao_generalista
+# entram na fila do mailman depois de 4 dias.
+# Ctrl+C encerra após o ciclo. Estado: logs/hunt_generalista_state.json
+
+# --- ciclo contínuo (só descoberta) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_generalista.py \
+  --focus-rs \
+  --max-tier 3 \
+  --min-pop-k 50 \
+  -n 8 \
+  --pause 8 \
+  --cycle-pause 60
+
+# --- um ciclo (uma cidade) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/hunt_generalista.py \
+  --focus-rs --max-tier 3 --min-pop-k 50 -n 8 --once
+
+# === MAILMAN (disparo, paralelo aos hunts) ===
+# Avalia quem NÃO recebeu e-mail nos últimos 4 dias.
+# 2 disparos por lote: 1 nicho + 1 generalista. Sem o par, espera. Pausa 2–5 min.
+# Ctrl+C encerra após o lote. Lock: logs/mailman/mailman.lock
+
+# --- loop contínuo ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/mailman.py \
+  --batch-size 2 \
+  --min-interval 120 \
+  --max-interval 300 \
+  --cooldown-days 4 \
+  --wait-days 4
+
+# --- um lote ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/mailman.py --once
+
+# --- ver fila sem enviar ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/mailman.py --plan
+
+# --- dry-run (não envia SMTP) ---
+cd /home/lucas/lg-prospector && source .venv/bin/activate && \
+PYTHONUNBUFFERED=1 python scripts/mailman.py --dry-run --once

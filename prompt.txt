@@ -1,21 +1,19 @@
-# --- Prospecção (contínua, roda em background) ---
-cd /home/lucas/lg-prospector && source .venv/bin/activate && \
-PYTHONUNBUFFERED=1 python scripts/hunt_loop.py \
-  --focus-rs \
-  --max-tier 2 \
-  -n 5 \
-  --stages discover,enrich,crm,dispatch \
-  --cooldown-days 4 \
-  --pause 8 \
-  --cycle-pause 60
+# Comandos separados:
+#   prompt-prospeccao.txt  — cockpit (os três + painel) ou hunts/mailman isolados
+#   prompt-correcao.txt    — purge nicho/nacionalidade, qualidade, bounces
 
-# --- Revisão de qualidade (rodar à parte, com a prospecção parada ou só em modo leitura) ---
-# Sem --apply-requeue: só relatório (logs/data_quality_review.jsonl), não toca no banco.
-cd /home/lucas/lg-prospector && source .venv/bin/activate && \
-PYTHONUNBUFFERED=1 python scripts/review_data_quality.py \
-  --stages crm_synced,sent \
-  -n 150
+# painel único:
+./cockpit
+./cockpit --attach   # só o painel de novo
+./cockpit --stop     # derruba os três
 
-# Com --apply-requeue (reenfileira itens com registro CRM ausente/divergente):
-# parar o hunt_loop.py antes de rodar, para evitar corrida no mesmo item.
-# python scripts/review_data_quality.py --stages crm_synced,sent -n 150 --apply-requeue
+tmux new-session -s hunt \; \
+  send-keys 'tail -f /home/lucas/lg-prospector/logs/hunt/console_loop.log' C-m \; \
+  split-window -v \; \
+  send-keys 'tail -f /home/lucas/lg-prospector/logs/hunt/console_generalista.log' C-m \; \
+  split-window -v \; \
+  send-keys 'tail -f /home/lucas/lg-prospector/logs/mailman/console.log' C-m \; \
+  select-layout even-vertical
+
+
+  
