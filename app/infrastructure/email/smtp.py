@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import random
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
@@ -13,6 +16,70 @@ from app.core.logging import get_logger
 from app.infrastructure.email.inline_images import build_mime_images, prepare_html_with_cid
 
 logger = get_logger(__name__)
+
+# Zoho/Gmail/etc. recusam o lote inteiro — não é bounce do destinatário.
+_PROVIDER_BLOCK_NEEDLES = (
+    "unusual sending activity",
+    "5.4.6",
+    "unblockme",
+    "temporarily blocked",
+    "sending limit",
+    "daily sending limit",
+    "relay not permitted",
+    "too many messages",
+    "try after sometime",
+)
+
+
+def is_smtp_provider_block(error: str | None) -> bool:
+    text = (error or "").lower()
+    return any(n in text for n in _PROVIDER_BLOCK_NEEDLES)
+
+
+async def count_recent_sends(session, *, since: datetime) -> int:
+    from sqlalchemy import func, select
+
+    from app.infrastructure.database.models import EmailRecord
+
+    q = (
+        select(func.count())
+        .select_from(EmailRecord)
+        .where(
+            EmailRecord.status.in_(["sent", "dry_run"]),
+            EmailRecord.sent_at.is_not(None),
+            EmailRecord.sent_at >= since,
+        )
+    )
+    return int((await session.execute(q)).scalar() or 0)
+
+
+async def smtp_quota_status(session) -> tuple[bool, str]:
+    """False se o teto horário/diário já foi atingido (não é bloqueio Zoho)."""
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    daily = int(settings.email_daily_limit or 0)
+    hourly = int(settings.email_hourly_limit or 0)
+    if hourly > 0:
+        n = await count_recent_sends(session, since=now - timedelta(hours=1))
+        if n >= hourly:
+            return False, f"hourly_limit:{n}/{hourly}"
+    if daily > 0:
+        n = await count_recent_sends(session, since=now - timedelta(hours=24))
+        if n >= daily:
+            return False, f"daily_limit:{n}/{daily}"
+    return True, "ok"
+
+
+async def pace_after_send(delay_seconds: float | None = None) -> None:
+    """Pausa entre disparos + jitter pra não parecer rajada."""
+    settings = get_settings()
+    delay = float(
+        settings.dispatch_delay_seconds if delay_seconds is None else delay_seconds
+    )
+    jitter = max(0.0, float(settings.dispatch_delay_jitter_seconds))
+    wait = max(0.0, delay) + (random.uniform(0.0, jitter) if jitter else 0.0)
+    if wait > 0:
+        await asyncio.sleep(wait)
 
 
 class SMTPService:
@@ -159,12 +226,20 @@ class SMTPService:
                 "inline_images": n_images,
             }
         except Exception as exc:
-            logger.error("email_send_failed", to=to, error=str(exc))
+            err = str(exc)
+            blocked = is_smtp_provider_block(err)
+            logger.error(
+                "email_send_failed",
+                to=to,
+                error=err,
+                provider_blocked=blocked,
+            )
             return {
-                "status": "failed",
+                "status": "blocked" if blocked else "failed",
                 "message_id": message_id,
                 "to": to,
                 "subject": subject,
                 "inline_images": n_images,
-                "error": str(exc),
+                "error": err,
+                "provider_blocked": blocked,
             }

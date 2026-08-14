@@ -253,6 +253,43 @@ class CRMClient:
     async def delete(self, entity: str, record_id: str) -> dict[str, Any]:
         return await self.request("DELETE", f"/{entity}/{record_id}")
 
+    async def delete_if_exists(self, entity: str, record_id: str) -> str:
+        """Apaga no Espo. 404 = já não existe (ok).
+
+        Não passa pelo circuit breaker: 404 em purge em massa não
+        pode derrubar o cliente.
+        Retorna: deleted | absent | skipped | error
+        """
+        rid = (record_id or "").strip()
+        if not rid:
+            return "skipped"
+        if self._dry_run or not self._enabled:
+            return "skipped"
+        url = f"{self.base_url}/{entity}/{rid}"
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.delete(url, headers=self._auth_header())
+        except Exception as exc:
+            logger.warning(
+                "crm_delete_transport",
+                entity=entity,
+                id=rid,
+                error=str(exc),
+            )
+            return "error"
+        if resp.status_code in (200, 204):
+            return "deleted"
+        if resp.status_code == 404:
+            return "absent"
+        logger.warning(
+            "crm_delete_http",
+            entity=entity,
+            id=rid,
+            status=resp.status_code,
+            body=(resp.text or "")[:240],
+        )
+        return "error"
+
     async def link(
         self,
         entity: str,

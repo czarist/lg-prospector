@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 from pathlib import Path
 
 from app.core.config import get_settings
@@ -11,15 +12,53 @@ from app.providers.registry import NICHE_TEMPLATES, get_provider_registry
 
 logger = get_logger(__name__)
 
-# Subjects padrão por nicho (sem nome do contato/empresa)
-SUBJECTS: dict[str, str] = {
-    "advogado": "Soluções para escritórios de advocacia",
-    "agencia_marketing": "Soluções para agências de marketing",
-    "empresa_ti": "Soluções para empresas de TI",
-    "prestador_servico": "Soluções para prestadores de serviço",
-    "grupo_midiatico": "Soluções para grupos de mídia",
-    # politico e partido são o mesmo nicho (canonicalize → politico)
-    "politico": "Soluções para equipes de campanha",
+# Assuntos por nicho — tom direto, com emoji leve.
+# Várias opções por nicho: cada envio sorteia uma (sem nome de contato/empresa).
+SUBJECTS: dict[str, list[str]] = {
+    "advogado": [
+        "⚖️ Como escritórios estão digitalizando o atendimento",
+        "📌 Menos burocracia no dia a dia do escritório",
+        "💼 Uma ideia rápida para o seu escritório de advocacia",
+        "✨ Tecnologia simples para quem vive de prazos",
+    ],
+    "agencia_marketing": [
+        "🚀 Algo que agências de marketing estão usando agora",
+        "📈 Como escalar entrega sem aumentar headcount",
+        "💡 Uma ideia prática para a sua agência",
+        "✨ Performance e operação — sem fricção extra",
+    ],
+    "empresa_ti": [
+        "⚙️ Uma conversa rápida sobre operação de TI",
+        "💻 Como times de TI estão cortando retrabalho",
+        "🔧 Ferramenta que encaixa no stack de quem entrega projeto",
+        "🚀 Ideia curta para empresas de tecnologia",
+    ],
+    "prestador_servico": [
+        "🛠️ Mais organização para quem presta serviço",
+        "📋 Atendimento e agenda sem planilha infinita",
+        "✨ Uma ideia prática pro seu negócio de serviços",
+        "💼 Como prestadores estão fechando mais com menos caos",
+    ],
+    "grupo_midiatico": [
+        "📺 Conteúdo e audiência com menos gargalo operacional",
+        "🎙️ Uma ideia para redações e grupos de mídia",
+        "📰 Como veículos estão acelerando a produção",
+        "✨ Operação de mídia sem atrito desnecessário",
+    ],
+    # politico e partido → canonicalize para politico
+    "politico": [
+        "🗳️ Campanha organizada, equipe alinhada",
+        "📣 Comunicação política com mais controle",
+        "🇧🇷 Uma ideia prática para equipes de campanha",
+        "✨ Menos caos operacional na campanha",
+    ],
+    "generalista": [
+        "✨ Sob medida para o seu negócio",
+        "🌐 Apareça no digital",
+        "🚀 Site, landing e SEO sem complicação",
+        "📌 Seu negócio encontrado no Google",
+        "💡 Presença digital que gera contato",
+    ],
 }
 
 
@@ -75,13 +114,20 @@ class TemplateSelector:
         )
         return filename, html, content_hash
 
-    def subject_for(self, niche: str) -> str:
-        """Assunto fixo do nicho — sem nome de contato ou empresa."""
+    def subject_for(self, niche: str, *, seed: str | None = None) -> str:
+        """Assunto do nicho (emoji + variação). Sem nome de contato/empresa.
+
+        Se `seed` for passado (ex.: id do item), a escolha é estável para
+        o mesmo seed; senão sorteia a cada chamada.
+        """
         from app.providers.registry import canonicalize_niche
 
         niche = canonicalize_niche(niche)
-        if niche in SUBJECTS:
-            return SUBJECTS[niche]
-        # fallback legível: "Soluções para <nicho>"
+        options = SUBJECTS.get(niche)
+        if options:
+            if seed:
+                idx = int(hashlib.sha256(f"{niche}:{seed}".encode()).hexdigest(), 16)
+                return options[idx % len(options)]
+            return random.choice(options)
         label = niche.replace("_", " ").strip() or "seu negócio"
-        return f"Soluções para {label}"
+        return f"✨ Soluções para {label}"

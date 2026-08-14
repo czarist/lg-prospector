@@ -214,7 +214,7 @@ async def _fetch_candidates(
             seen.add(key)
             batch.append(c)
 
-        await asyncio.sleep(0.4)  # gentileza rate-limit
+        await asyncio.sleep(0.15)  # gentileza rate-limit
 
     return batch
 

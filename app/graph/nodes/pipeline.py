@@ -376,7 +376,9 @@ async def send_email_node(state: CampaignGraphState) -> dict[str, Any]:
     niche = state.get("niche") or ""
     selector = TemplateSelector()
     filename, html, _ = selector.load(niche)
-    subject = selector.subject_for(niche)
+    subject = selector.subject_for(
+        niche, seed=str(state.get("campaign_item_id") or state.get("thread_id") or to)
+    )
 
     smtp = SMTPService()
     result = await smtp.send_html(to=to, subject=subject, html_body=html)

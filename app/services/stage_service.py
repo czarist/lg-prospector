@@ -37,7 +37,12 @@ from app.infrastructure.database.models import (
     EmailRecord,
     ItemStatus,
 )
-from app.infrastructure.email.smtp import SMTPService
+from app.infrastructure.email.smtp import (
+    SMTPService,
+    is_smtp_provider_block,
+    pace_after_send,
+    smtp_quota_status,
+)
 from app.infrastructure.email.templates import TemplateSelector
 from app.infrastructure.redis.rate_limit import RateLimiter
 from app.providers.domain_email import extract_registrable_domain
@@ -65,7 +70,7 @@ def _normalize_company_name(name: str) -> str:
 class StageService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
-        self.rate_limiter = RateLimiter(key_prefix="dispatch", max_requests=30, window_seconds=60)
+        self.rate_limiter = RateLimiter(key_prefix="dispatch")
 
     async def get_campaign(self, campaign_id: str) -> Campaign | None:
         result = await self.session.execute(
@@ -134,6 +139,7 @@ class StageService:
             city=campaign.city or "",
             state=campaign.state or "",
             max_results=fetch_n,
+            extra={"discover_round": round_idx, "query_round": round_idx},
         )
         found = await provider.search_companies(ctx)
 
@@ -192,20 +198,26 @@ class StageService:
             if n:
                 existing_names.add(n)
 
-        # já existentes globalmente (outras campanhas/ciclos) — a constraint
-        # uq_company_name_city_host é da tabela inteira, não só desta campanha
-        # (o "escada de cidades" cria uma campanha nova por cidade/nicho/ciclo,
-        # então sem isso a mesma empresa colide de novo a cada rodada)
-        global_rows = (
+        # já existentes globalmente (outras campanhas/ciclos) — ignora o que
+        # já foi pesquisado: mesmo host em qualquer cidade, mesmo nome na cidade
+        city_rows = (
             await self.session.execute(
                 select(Company.name, Company.website_host).where(
                     Company.city == (campaign.city or "")
                 )
             )
         ).all()
-        for g_name, g_host in global_rows:
+        for g_name, g_host in city_rows:
             if g_name:
                 existing_names.add(_normalize_company_name(g_name))
+            if g_host:
+                existing_hosts.add(g_host.strip().lower())
+        host_rows = (
+            await self.session.execute(
+                select(Company.website_host).where(Company.website_host.is_not(None))
+            )
+        ).scalars().all()
+        for g_host in host_rows:
             if g_host:
                 existing_hosts.add(g_host.strip().lower())
 
@@ -229,13 +241,38 @@ class StageService:
 
             website_host = domain or None
 
+            # se o provider já achou e-mail (ex.: TSE+web), grava seed p/ enrich
+            from app.providers.email_enrichment import has_valid_email
+            from app.providers.public_org import is_public_email
+
+            seed_email = (pr.email or "").strip() or None
+            allow_gov = (campaign.niche or "").lower() == "generalista"
+            if seed_email and (
+                not has_valid_email(seed_email)
+                or is_public_email(seed_email, allow_gov_br=allow_gov)
+            ):
+                seed_email = None
+            if seed_email:
+                from app.providers.geo_email import classify_contact_email
+
+                ok_geo, _reason = classify_contact_email(
+                    seed_email,
+                    name=pr.contact_name or pr.company_name,
+                    city=pr.city or campaign.city or "",
+                    party=str((pr.extra or {}).get("tse_partido") or ""),
+                    website=pr.website or "",
+                    segment=campaign.niche,
+                )
+                if not ok_geo:
+                    seed_email = None
+
             company = Company(
                 id=uuid4().hex,
                 name=(pr.company_name or "Sem nome")[:191],
                 website=pr.website or None,
                 website_host=website_host,
                 phone=pr.phone or None,
-                email=None,  # só após enrich
+                email=seed_email,  # seed; enrich confirma / completa
                 city=pr.city or campaign.city,
                 state=pr.state or campaign.state,
                 segment=campaign.niche,
@@ -327,15 +364,19 @@ class StageService:
                 continue
 
             # pré-filtro barato (sem scrape/LLM)
+            raw = item.raw_data or {}
+            seed_email = (company.email or raw.get("email") or "") or ""
             pr = ProviderResult(
                 company_name=company.name,
                 website=company.website or "",
                 phone=company.phone or "",
+                email=seed_email,
                 city=company.city or "",
                 state=company.state or "",
                 segment=company.segment or campaign.niche,
                 source=company.source or "",
-                extra=company.extra or (item.raw_data or {}),
+                contact_name=(raw.get("contact_name") or "") or "",
+                extra=company.extra or raw,
             )
             if not pr.is_valid_company():
                 item.stage = ItemStageStatus.DISCARDED.value
@@ -346,13 +387,21 @@ class StageService:
                 continue
 
             domain = item.company_domain or extract_registrable_domain(company.website or "")
-            require_domain = bool(domain)
-
-            kept = await require_email(pr, deep=True, require_domain=require_domain)
+            niche_l = (campaign.niche or "").lower()
+            is_politico = niche_l in {"politico", "partido"}
+            is_generalista = niche_l == "generalista"
+            # político/generalista: aceita free-mail; não exige e-mail = domínio do site
+            require_domain = bool(domain) and not is_politico and not is_generalista
+            kept = await require_email(
+                pr,
+                deep=True,
+                require_domain=require_domain,
+                allow_free_mail=is_politico or is_generalista or not domain,
+            )
             if not kept or not has_valid_email(kept.email):
                 item.stage = ItemStageStatus.DISCARDED.value
                 item.status = ItemStatus.SKIPPED.value
-                item.error_message = "sem e-mail do domínio"
+                item.error_message = "sem e-mail"
                 discarded += 1
                 logger.info("enrich_discarded", company=company.name, domain=domain)
                 if pause:
@@ -438,6 +487,10 @@ class StageService:
                 item.error_message = "sem contact/email para CRM"
                 failed += 1
                 continue
+            extra = company.extra or {}
+            desc = extra.get("crm_description") or (
+                f"LG Prospector | origem={extra.get('origin') or campaign.niche} | {campaign.id}"
+            )
             res = await sync.sync_prospect(
                 company_name=company.name,
                 contact_name=contact.name,
@@ -447,7 +500,7 @@ class StageService:
                 city=company.city or "",
                 state=company.state or "",
                 niche=campaign.niche,
-                description=f"LG Prospector | {campaign.niche} | {campaign.id}",
+                description=str(desc)[:10000],
             )
             item.crm_company_id = res.account_id
             item.crm_contact_id = res.contact_id
@@ -504,6 +557,24 @@ class StageService:
 
         cfg = campaign.config or {}
         skip = bool(cfg.get("skip_email", False))
+        # generalista tem rotina própria (4 dias + texto personalizado)
+        if (campaign.niche or "").lower() == "generalista" and not cfg.get(
+            "force_niche_dispatch"
+        ):
+            logger.info("dispatch_skip_generalista", campaign_id=campaign.id)
+            campaign.current_stage = CampaignStage.CRM.value
+            await self._log(
+                campaign.id,
+                "stage_dispatch",
+                "skip: use scripts/hunt_generalista.py (espera 4d + e-mail personalizado)",
+            )
+            await self.session.flush()
+            return {
+                "stage": "dispatch",
+                "sent": 0,
+                "skipped": True,
+                "reason": "generalista_own_routine",
+            }
         if skip:
             campaign.current_stage = CampaignStage.DONE.value
             campaign.status = CampaignStatus.COMPLETED.value
@@ -535,15 +606,34 @@ class StageService:
         selector = TemplateSelector()
         smtp = SMTPService()
         template_name, html, content_hash = selector.load(campaign.niche)
-        subject_base = selector.subject_for(campaign.niche)
 
         sent = 0
         failed = 0
         cooldown_skipped = 0
+        quota_skipped = 0
+        provider_blocked = False
         cooldown_cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, cooldown_days))
 
         # e-mails já enviados nesta rodada (evita duplicata no mesmo batch)
         batch_sent: set[str] = set()
+
+        quota_ok, quota_why = await smtp_quota_status(self.session)
+        if not quota_ok:
+            logger.warning("dispatch_quota_pause", reason=quota_why, campaign_id=campaign.id)
+            await self._log(campaign.id, "dispatch_quota", f"pausa envio ({quota_why}); busca segue")
+            return {
+                "stage": "dispatch",
+                "sent": 0,
+                "failed": 0,
+                "cooldown_skipped": 0,
+                "quota_skipped": len(items),
+                "quota_reason": quota_why,
+                "provider_blocked": False,
+                "cooldown_days": cooldown_days,
+                "template": template_name,
+                "dry_run": dry_run,
+                "next": CampaignStage.DISPATCH.value,
+            }
 
         for item in items:
             contact = item.contact
@@ -555,6 +645,64 @@ class StageService:
                 continue
 
             to_addr = contact.email.strip().lower()
+
+            # nunca enviar para domínio de órgão público (.gov / .leg / .jus / MP…)
+            from app.providers.public_org import is_public_email, is_public_organ
+
+            if is_public_email(to_addr) or is_public_organ(
+                name=(company.name if company else "") or "",
+                website=(company.website if company else "") or "",
+                email=to_addr,
+                segment=campaign.niche,
+            ):
+                item.stage = ItemStageStatus.FAILED.value
+                item.status = ItemStatus.FAILED.value
+                item.error_message = "orgao_publico_bloqueado"
+                failed += 1
+                logger.info("dispatch_public_org_skip", to=to_addr, company=company.name if company else None)
+                continue
+
+            from app.providers.geo_email import classify_contact_email
+
+            extra = (company.extra if company else None) or {}
+            ok_geo, geo_reason = classify_contact_email(
+                to_addr,
+                name=(contact.name or (company.name if company else "") or ""),
+                city=(company.city if company else "") or "",
+                party=str(extra.get("tse_partido") or ""),
+                website=(company.website if company else "") or "",
+                segment=campaign.niche,
+            )
+            if not ok_geo:
+                item.stage = ItemStageStatus.FAILED.value
+                item.status = ItemStatus.FAILED.value
+                item.error_message = f"email_implausivel:{geo_reason}"
+                failed += 1
+                logger.info(
+                    "dispatch_implausible_email_skip",
+                    to=to_addr,
+                    reason=geo_reason,
+                    company=company.name if company else None,
+                )
+                continue
+
+            # nunca reenviar endereço que já bounceou (caixa inexistente etc.)
+            if await self._email_was_bounced(to_addr, contact_id=contact.id):
+                item.stage = ItemStageStatus.FAILED.value
+                item.status = ItemStatus.FAILED.value
+                item.error_message = "email_bounced_blacklist"
+                failed += 1
+                logger.info(
+                    "dispatch_bounce_skip",
+                    to=to_addr,
+                    company=company.name if company else None,
+                )
+                await self._log(
+                    campaign.id,
+                    "dispatch_bounce_skip",
+                    f"skip {to_addr} (bounce anterior)",
+                )
+                continue
 
             # cooldown global por endereço (qualquer campanha)
             if to_addr in batch_sent or await self._email_in_cooldown(
@@ -576,6 +724,13 @@ class StageService:
                 )
                 continue
 
+            quota_ok, quota_why = await smtp_quota_status(self.session)
+            if not quota_ok:
+                quota_skipped += 1
+                item.error_message = quota_why
+                logger.warning("dispatch_quota_pause", reason=quota_why, to=to_addr)
+                break
+
             # rate limit global de disparo
             allowed = await self.rate_limiter.acquire("smtp")
             if not allowed:
@@ -586,8 +741,8 @@ class StageService:
                 failed += 1
                 continue
 
-            # assunto fixo do nicho — sem nome do contato/empresa
-            subject = subject_base
+            # assunto por nicho (emoji + variação estável por item)
+            subject = selector.subject_for(campaign.niche, seed=item.id)
 
             item.stage = ItemStageStatus.QUEUED.value
             await self.session.flush()
@@ -600,6 +755,7 @@ class StageService:
             )
             status = send_result.get("status")
             msg_id = send_result.get("message_id")
+            rec_status = "failed" if status == "blocked" else (status or "failed")
 
             self.session.add(
                 EmailRecord(
@@ -611,7 +767,7 @@ class StageService:
                     subject=subject,
                     template_name=template_name,
                     body_hash=content_hash,
-                    status=status or "failed",
+                    status=rec_status,
                     message_id=msg_id,
                     error_message=send_result.get("error"),
                     sent_at=datetime.now(timezone.utc)
@@ -634,6 +790,25 @@ class StageService:
                     status=status,
                     template=template_name,
                 )
+            elif send_result.get("provider_blocked") or is_smtp_provider_block(
+                send_result.get("error")
+            ):
+                # conta bloqueou o lote — lead volta pra fila, não queima como failed
+                item.stage = ItemStageStatus.CRM_SYNCED.value
+                item.error_message = "smtp_provider_block"
+                provider_blocked = True
+                logger.error(
+                    "dispatch_provider_block",
+                    to=contact.email,
+                    error=send_result.get("error"),
+                )
+                await self._log(
+                    campaign.id,
+                    "dispatch_provider_block",
+                    f"SMTP bloqueou o envio ({send_result.get('error')}); lote interrompido",
+                )
+                await self.session.flush()
+                break
             else:
                 item.stage = ItemStageStatus.FAILED.value
                 item.status = ItemStatus.FAILED.value
@@ -641,8 +816,7 @@ class StageService:
                 failed += 1
 
             await self.session.flush()
-            if delay_seconds > 0:
-                await asyncio.sleep(delay_seconds)
+            await pace_after_send(delay_seconds)
 
         campaign.current_stage = CampaignStage.DISPATCH.value
         # se todos processados → done (cooldown não conta como pendente de envio imediato)
@@ -652,7 +826,7 @@ class StageService:
         )
         # itens em cooldown ficam crm_synced; campanha ainda pode ir para done se
         # o restante foi enviado — reprocessar cooldown numa próxima passada
-        if pending == cooldown_skipped or pending == 0:
+        if not provider_blocked and (pending == cooldown_skipped or pending == 0):
             campaign.current_stage = CampaignStage.DONE.value
             campaign.status = CampaignStatus.COMPLETED.value
             campaign.finished_at = datetime.now(timezone.utc)
@@ -661,6 +835,7 @@ class StageService:
             campaign.id,
             "stage_dispatch",
             f"sent={sent} failed={failed} cooldown_skip={cooldown_skipped} "
+            f"quota_skip={quota_skipped} provider_blocked={provider_blocked} "
             f"dry_run={dry_run} template={template_name} cooldown_days={cooldown_days}",
         )
         await self.session.flush()
@@ -669,12 +844,204 @@ class StageService:
             "sent": sent,
             "failed": failed,
             "cooldown_skipped": cooldown_skipped,
+            "quota_skipped": quota_skipped,
+            "provider_blocked": provider_blocked,
             "cooldown_days": cooldown_days,
             "template": template_name,
             "dry_run": dry_run,
             "next": CampaignStage.DONE.value
             if campaign.current_stage == CampaignStage.DONE.value
             else CampaignStage.DISPATCH.value,
+        }
+
+    async def send_one_item(
+        self,
+        item: CampaignItem,
+        *,
+        campaign: Campaign | None = None,
+        dry_run: bool = False,
+        cooldown_days: int | None = None,
+        smtp: SMTPService | None = None,
+        selector: TemplateSelector | None = None,
+        template_name: str | None = None,
+        html: str | None = None,
+        content_hash: str | None = None,
+        batch_sent: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Envia o template do nicho para um único item crm_synced.
+
+        Usado pelo mailman (lote global) e reutilizável pelo dispatch da campanha.
+        Não marca a campanha como done — só avança o item.
+        """
+        from datetime import timedelta
+
+        from app.core.config import get_settings
+        from app.providers.geo_email import classify_contact_email
+        from app.providers.public_org import is_public_email, is_public_organ
+
+        settings = get_settings()
+        if cooldown_days is None:
+            cooldown_days = int(settings.email_cooldown_days)
+        campaign = campaign or item.campaign
+        contact = item.contact
+        company = item.company
+        if not contact or not contact.email:
+            item.stage = ItemStageStatus.FAILED.value
+            item.error_message = "sem e-mail no contato"
+            await self.session.flush()
+            return {"outcome": "failed", "reason": "sem_email", "to": ""}
+
+        to_addr = contact.email.strip().lower()
+        niche = (campaign.niche if campaign else "") or (company.segment if company else "") or ""
+
+        if is_public_email(to_addr) or is_public_organ(
+            name=(company.name if company else "") or "",
+            website=(company.website if company else "") or "",
+            email=to_addr,
+            segment=niche,
+        ):
+            item.stage = ItemStageStatus.FAILED.value
+            item.status = ItemStatus.FAILED.value
+            item.error_message = "orgao_publico_bloqueado"
+            await self.session.flush()
+            return {"outcome": "failed", "reason": "orgao_publico", "to": to_addr}
+
+        extra = (company.extra if company else None) or {}
+        ok_geo, geo_reason = classify_contact_email(
+            to_addr,
+            name=(contact.name or (company.name if company else "") or ""),
+            city=(company.city if company else "") or "",
+            party=str(extra.get("tse_partido") or ""),
+            website=(company.website if company else "") or "",
+            segment=niche,
+        )
+        if not ok_geo:
+            item.stage = ItemStageStatus.FAILED.value
+            item.status = ItemStatus.FAILED.value
+            item.error_message = f"email_implausivel:{geo_reason}"
+            await self.session.flush()
+            return {"outcome": "failed", "reason": f"email_implausivel:{geo_reason}", "to": to_addr}
+
+        extra_c = contact.extra or {}
+        if extra_c.get("opt_out") or extra.get("opt_out"):
+            return {"outcome": "skip", "reason": "opt_out", "to": to_addr}
+        if extra_c.get("negociacao_ativa") or extra.get("negociacao_ativa"):
+            return {"outcome": "skip", "reason": "negociacao_ativa", "to": to_addr}
+
+        if await self._email_was_bounced(to_addr, contact_id=contact.id):
+            item.stage = ItemStageStatus.FAILED.value
+            item.status = ItemStatus.FAILED.value
+            item.error_message = "email_bounced_blacklist"
+            await self.session.flush()
+            return {"outcome": "failed", "reason": "bounce", "to": to_addr}
+
+        cooldown_cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, cooldown_days))
+        if (batch_sent and to_addr in batch_sent) or await self._email_in_cooldown(
+            to_addr, contact_id=contact.id, since=cooldown_cutoff
+        ):
+            item.error_message = f"cooldown_{cooldown_days}d"
+            await self.session.flush()
+            return {"outcome": "cooldown", "reason": f"cooldown_{cooldown_days}d", "to": to_addr}
+
+        quota_ok, quota_why = await smtp_quota_status(self.session)
+        if not quota_ok:
+            item.error_message = quota_why
+            await self.session.flush()
+            return {"outcome": "quota", "reason": quota_why, "to": to_addr}
+
+        allowed = await self.rate_limiter.acquire("smtp")
+        if not allowed:
+            await asyncio.sleep(2.0)
+            allowed = await self.rate_limiter.acquire("smtp")
+        if not allowed:
+            item.error_message = "rate_limit"
+            await self.session.flush()
+            return {"outcome": "failed", "reason": "rate_limit", "to": to_addr}
+
+        selector = selector or TemplateSelector()
+        smtp = smtp or SMTPService()
+        if not template_name or html is None or content_hash is None:
+            template_name, html, content_hash = selector.load(niche)
+        subject = selector.subject_for(niche, seed=item.id)
+
+        item.stage = ItemStageStatus.QUEUED.value
+        await self.session.flush()
+
+        send_result = await smtp.send_html(
+            to=contact.email,
+            subject=subject,
+            html_body=html,
+            dry_run=dry_run,
+        )
+        status = send_result.get("status")
+        rec_status = "failed" if status == "blocked" else (status or "failed")
+
+        self.session.add(
+            EmailRecord(
+                id=uuid4().hex,
+                contact_id=contact.id,
+                campaign_item_id=item.id,
+                to_address=contact.email,
+                from_address=smtp.from_addr,
+                subject=subject,
+                template_name=template_name,
+                body_hash=content_hash,
+                status=rec_status,
+                message_id=send_result.get("message_id"),
+                error_message=send_result.get("error"),
+                sent_at=datetime.now(timezone.utc) if status in {"sent", "dry_run"} else None,
+            )
+        )
+
+        if status in {"sent", "dry_run"}:
+            item.stage = ItemStageStatus.SENT.value
+            item.status = ItemStatus.EMAIL_SENT.value
+            item.template_name = template_name
+            item.email_sent_at = datetime.now(timezone.utc)
+            if batch_sent is not None:
+                batch_sent.add(to_addr)
+            await self.session.flush()
+            logger.info(
+                "dispatch_sent",
+                to=contact.email,
+                subject=subject,
+                status=status,
+                template=template_name,
+                via="mailman_or_item",
+            )
+            return {
+                "outcome": status,
+                "reason": "ok",
+                "to": to_addr,
+                "template": template_name,
+                "subject": subject,
+            }
+
+        if send_result.get("provider_blocked") or is_smtp_provider_block(send_result.get("error")):
+            item.stage = ItemStageStatus.CRM_SYNCED.value
+            item.error_message = "smtp_provider_block"
+            await self.session.flush()
+            logger.error(
+                "dispatch_provider_block",
+                to=contact.email,
+                error=send_result.get("error"),
+            )
+            return {
+                "outcome": "blocked",
+                "reason": send_result.get("error") or "smtp_provider_block",
+                "to": to_addr,
+                "template": template_name,
+            }
+
+        item.stage = ItemStageStatus.FAILED.value
+        item.status = ItemStatus.FAILED.value
+        item.error_message = send_result.get("error") or "send_failed"
+        await self.session.flush()
+        return {
+            "outcome": "failed",
+            "reason": send_result.get("error") or "send_failed",
+            "to": to_addr,
+            "template": template_name,
         }
 
     async def _email_in_cooldown(
@@ -705,6 +1072,31 @@ class StageService:
             select(func.count())
             .select_from(EmailRecord)
             .where(*clauses, or_(*identity))
+        )
+        n = int((await self.session.execute(q)).scalar() or 0)
+        return n > 0
+
+    async def _email_was_bounced(
+        self,
+        to_address: str,
+        *,
+        contact_id: str | None,
+    ) -> bool:
+        """True se já houve bounce permanente para este endereço (qualquer data)."""
+        from sqlalchemy import func, or_
+
+        addr = (to_address or "").strip().lower()
+        if not addr:
+            return False
+
+        identity = [func.lower(EmailRecord.to_address) == addr]
+        if contact_id:
+            identity.append(EmailRecord.contact_id == contact_id)
+
+        q = (
+            select(func.count())
+            .select_from(EmailRecord)
+            .where(EmailRecord.status == "bounced", or_(*identity))
         )
         n = int((await self.session.execute(q)).scalar() or 0)
         return n > 0

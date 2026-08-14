@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Loop contínuo de prospecção: 5 leads × nicho × cidade (escada comercial).
 
+Só prospecta (discover → enrich → crm). O disparo de e-mail é o mailman:
+  python scripts/mailman.py
+
+
 Ordem de cidades (escadinha):
   1. Capitais (Porto Alegre / RS primeiro se --focus-rs)
   2. Polos gaúchos (Caxias, Canoas, Pelotas, …)
@@ -20,6 +24,11 @@ Exemplos:
 
   # dry-run: só imprime a fila
   python scripts/hunt_loop.py --plan-only
+
+Cada ciclo busca de novo e ignora empresa já cadastrada. Bater a cota N
+não encerra o nicho×cidade — a próxima volta usa outra query.
+
+--skip-completed volta ao modo escada (uma vez por nicho×cidade).
 """
 
 from __future__ import annotations
@@ -38,7 +47,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.core.config import get_settings
+from app.core.live import write_live
 from app.core.logging import get_logger, setup_logging
+from app.core.paths import logs_dir
 from app.domain.cities import (
     DEFAULT_NICHES,
     CityTarget,
@@ -52,9 +63,15 @@ from app.services.stage_service import StageService
 
 logger = get_logger(__name__)
 
-STATE_PATH = ROOT / "logs" / "hunt_loop_state.json"
-LOG_DIR = ROOT / "logs" / "hunt"
-DEFAULT_STAGES = ["discover", "enrich", "crm", "dispatch"]
+def _state_path() -> Path:
+    return logs_dir() / "hunt_loop_state.json"
+
+
+def _hunt_log_dir() -> Path:
+    return logs_dir() / "hunt"
+
+
+DEFAULT_STAGES = ["discover", "enrich", "crm"]
 
 _stop = False
 
@@ -69,7 +86,7 @@ class HuntFileLogger:
     """Dois arquivos por dia: results + errors (JSONL) e espelho texto legível."""
 
     def __init__(self, log_dir: Path | None = None) -> None:
-        self.log_dir = log_dir or LOG_DIR
+        self.log_dir = log_dir or _hunt_log_dir()
         self.log_dir.mkdir(parents=True, exist_ok=True)
         day = datetime.now().strftime("%Y%m%d")
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -214,6 +231,7 @@ async def _run_one(
     cooldown_days: int = 4,
     file_log: HuntFileLogger | None = None,
 ) -> dict[str, Any]:
+    global _stop
     get_settings.cache_clear()
     reset_engine()
     await init_db()
@@ -245,6 +263,8 @@ async def _run_one(
                 "hunt_loop": True,
                 "city_tier": city.tier,
                 "city_pop_k": city.population_k,
+                "query_round": query_round,
+                "discover_round": query_round,
             },
             run_async=False,
         )
@@ -256,6 +276,7 @@ async def _run_one(
             if _stop:
                 break
             _echo(f"  === {st} ===")
+            write_live("nicho", {"phase": st, "detail": f"etapa {st}"})
             try:
                 if st == "dispatch":
                     campaign = await stage_svc.get_campaign(cid)
@@ -269,6 +290,12 @@ async def _run_one(
                         dry_run=dry_run_dispatch,
                         cooldown_days=cooldown_days,
                     )
+                    if isinstance(result, dict) and result.get("provider_blocked"):
+                        _echo(
+                            "  ✗ SMTP bloqueado (Zoho 550 unusual activity). "
+                            "Parando o hunt para não marcar lead como failed."
+                        )
+                        _stop = True
                 else:
                     result = await stage_svc.run_stage(cid, st)
             except Exception as stage_exc:
@@ -289,6 +316,19 @@ async def _run_one(
 
             stage_results[st] = result
             _echo(f"  {result}")
+            if isinstance(result, dict):
+                if st == "discover":
+                    detail = f"achou {result.get('companies_found', 0)}"
+                elif st == "enrich":
+                    detail = (
+                        f"+{result.get('enriched', 0)} e-mail  "
+                        f"desc {result.get('discarded', 0)}"
+                    )
+                elif st == "crm":
+                    detail = f"crm {result.get('synced', 0)}  falha {result.get('failed', 0)}"
+                else:
+                    detail = f"etapa {st}"
+                write_live("nicho", {"phase": st, "detail": detail})
             if file_log:
                 file_log.stage(
                     niche=niche,
@@ -403,18 +443,23 @@ async def main() -> None:
     )
     p.add_argument(
         "--stages",
-        default="discover,enrich,crm,dispatch",
-        help="Etapas csv (default inclui dispatch de e-mail por nicho)",
+        default="discover,enrich,crm",
+        help="Etapas csv (default: discover,enrich,crm — disparo é o mailman)",
+    )
+    p.add_argument(
+        "--dispatch",
+        action="store_true",
+        help="Inclui etapa dispatch neste hunt (legado; prefira scripts/mailman.py)",
     )
     p.add_argument(
         "--dry-run-dispatch",
         action="store_true",
-        help="Monta e-mails mas não envia via SMTP",
+        help="Monta e-mails mas não envia via SMTP (só com --dispatch)",
     )
     p.add_argument(
         "--no-dispatch",
         action="store_true",
-        help="Não envia e-mail (só discover→enrich→crm)",
+        help="Garante que dispatch não entra (já é o default)",
     )
     p.add_argument(
         "--cooldown-days",
@@ -422,15 +467,15 @@ async def main() -> None:
         default=4,
         help="Não reenviar pro mesmo contato em menos de N dias (default 4)",
     )
-    p.add_argument("--pause", type=float, default=8.0, help="Pausa entre jobs (s)")
-    p.add_argument("--cycle-pause", type=float, default=60.0, help="Pausa entre voltas (s)")
+    p.add_argument("--pause", type=float, default=3.0, help="Pausa entre jobs (s)")
+    p.add_argument("--cycle-pause", type=float, default=20.0, help="Pausa entre voltas (s)")
     p.add_argument("--once", action="store_true", help="Uma volta na fila e encerra")
     p.add_argument("--max-jobs", type=int, default=0, help="Para após N jobs (0=∞)")
     p.add_argument(
         "--skip-completed",
         action="store_true",
-        default=True,
-        help="Pula niche×cidade já completo (default)",
+        default=False,
+        help="Modo escada: pula niche×cidade já feito neste state",
     )
     p.add_argument(
         "--redo",
@@ -442,12 +487,21 @@ async def main() -> None:
         action="store_true",
         help="Só marca complete se atingiu N leads; senão re-tenta depois",
     )
+    p.add_argument(
+        "--max-partial-attempts",
+        type=int,
+        default=5,
+        help=(
+            "Após N tentativas parciais (good < meta ok) no mesmo job, desiste e "
+            "marca completed/skipped (0=ilimitado; default 5)"
+        ),
+    )
     p.add_argument("--plan-only", action="store_true", help="Só lista a fila e sai")
-    p.add_argument("--state-file", default=str(STATE_PATH))
+    p.add_argument("--state-file", default=str(_state_path()))
     p.add_argument(
         "--log-dir",
-        default=str(LOG_DIR),
-        help="Pasta dos logs results/errors (default logs/hunt)",
+        default=str(_hunt_log_dir()),
+        help="Pasta dos logs results/errors (default LOGS_DIR/hunt)",
     )
     p.add_argument(
         "--niche-first",
@@ -468,7 +522,7 @@ async def main() -> None:
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
     if args.no_dispatch:
         stages = [s for s in stages if s != "dispatch"]
-    elif "dispatch" not in stages and not args.no_dispatch:
+    elif args.dispatch and "dispatch" not in stages:
         stages.append("dispatch")
     states = [s.strip().upper() for s in args.states.split(",") if s.strip()] or None
     city_limit = args.city_limit or None
@@ -496,9 +550,12 @@ async def main() -> None:
     )
     print(
         f"stages={stages} | cooldown={args.cooldown_days}d | "
-        f"dry_run_dispatch={args.dry_run_dispatch}",
+        f"dry_run_dispatch={args.dry_run_dispatch} | "
+        f"max_partial_attempts={args.max_partial_attempts}",
         flush=True,
     )
+    if "dispatch" not in stages:
+        print("disparo: scripts/mailman.py (este hunt só prospecta)", flush=True)
     print(
         f"focus_rs={focus_rs} only_rs={args.only_rs} max_tier={args.max_tier} "
         f"min_pop_k={args.min_pop_k}",
@@ -519,7 +576,7 @@ async def main() -> None:
             print(f"  - {niche:20} @ {city.label}")
         return
 
-    file_log = HuntFileLogger(Path(args.log_dir) if args.log_dir else LOG_DIR)
+    file_log = HuntFileLogger(Path(args.log_dir) if args.log_dir else _hunt_log_dir())
     print(f"logs → {file_log.log_dir}", flush=True)
     print(f"  results: {file_log.results_jsonl.name} / {file_log.results_txt.name}", flush=True)
     print(f"  errors:  {file_log.errors_jsonl.name} / {file_log.errors_txt.name}", flush=True)
@@ -534,6 +591,7 @@ async def main() -> None:
     state = _load_state(state_path)
     completed: dict = state.setdefault("completed", {})
     failed: dict = state.setdefault("failed", {})
+    visits: dict = state.setdefault("visits", {})
 
     jobs_done = 0
     jobs_ok = 0
@@ -559,17 +617,39 @@ async def main() -> None:
             key = _job_key(niche, city)
             if not args.redo and args.skip_completed and key in completed:
                 prev = completed[key]
-                if args.require_full and not prev.get("full"):
-                    pass  # reprocessa incompletos
+                # reprocessa incompletos só se --require-full e ainda não desistiu
+                if (
+                    args.require_full
+                    and not prev.get("full")
+                    and not prev.get("skipped")
+                ):
+                    pass
                 else:
                     continue
 
+            visit_n = int(visits.get(key) or 0)
             header = (
                 f"\n--- [{idx+1}/{len(jobs)}] {niche} @ {city.label} "
-                f"(T{city.tier} pop~{city.population_k}k) ---"
+                f"(T{city.tier} pop~{city.population_k}k) visita={visit_n+1} ---"
             )
             print(header, flush=True)
             file_log.log_console(header)
+            write_live(
+                "nicho",
+                {
+                    "status": "running",
+                    "cycle": cycle,
+                    "index": idx + 1,
+                    "total": len(jobs),
+                    "niche": niche,
+                    "city": city.label,
+                    "phase": "job",
+                    "detail": f"visita {visit_n + 1}",
+                    "job_started_at": datetime.now(timezone.utc).isoformat(),
+                    "ok": jobs_ok,
+                    "err": jobs_err,
+                },
+            )
             t0 = time.monotonic()
             try:
                 result = await _run_one(
@@ -577,7 +657,7 @@ async def main() -> None:
                     city=city,
                     max_results=args.max,
                     stages=stages,
-                    query_round=cycle + idx,
+                    query_round=visit_n,
                     dry_run_dispatch=args.dry_run_dispatch,
                     cooldown_days=args.cooldown_days,
                     file_log=file_log,
@@ -611,12 +691,30 @@ async def main() -> None:
                     print(msg, flush=True)
                     file_log.log_console(msg)
                 else:
-                    # parcial fraco: results + errors (para amanhã revisar)
+                    # parcial fraco: conta tentativas e desiste após o teto
+                    prev_fail = failed.get(key) or {}
+                    attempts = int(prev_fail.get("attempts") or 0) + 1
+                    zero_streak = int(prev_fail.get("zero_good_streak") or 0)
+                    if int(result.get("good") or 0) == 0:
+                        zero_streak += 1
+                    else:
+                        zero_streak = 0
+                    best_good = max(
+                        int(prev_fail.get("best_good") or 0),
+                        int(result.get("good") or 0),
+                    )
                     failed[key] = {
                         "good": result["good"],
+                        "attempts": attempts,
+                        "zero_good_streak": zero_streak,
+                        "best_good": best_good,
                         "at": datetime.now(timezone.utc).isoformat(),
                         "items": result.get("items_by_stage"),
+                        "campaign_id": result.get("campaign_id"),
                     }
+                    max_att = int(args.max_partial_attempts or 0)
+                    give_up = max_att > 0 and attempts >= max_att
+
                     file_log.error(
                         {
                             "event": "job_partial",
@@ -626,27 +724,78 @@ async def main() -> None:
                             "campaign_id": result.get("campaign_id"),
                             "good": result.get("good"),
                             "target": result.get("target"),
+                            "attempts": attempts,
+                            "zero_good_streak": zero_streak,
+                            "best_good": best_good,
+                            "max_partial_attempts": max_att or None,
+                            "gave_up": give_up,
                             "items_by_stage": result.get("items_by_stage"),
-                            "message": "meta incompleta",
+                            "message": (
+                                "max_partial_attempts — desistindo"
+                                if give_up
+                                else "meta incompleta"
+                            ),
                         }
                     )
-                    msg = (
-                        f"  ~ parcial good={result['good']}/{args.max} "
-                        f"— re-tentará em outro ciclo"
-                    )
-                    print(msg, flush=True)
-                    file_log.log_console(msg)
 
+                    if give_up:
+                        completed[key] = {
+                            "campaign_id": result.get("campaign_id"),
+                            "good": result["good"],
+                            "full": False,
+                            "emails_sent": result.get("emails_sent"),
+                            "skipped": True,
+                            "skip_reason": "max_partial_attempts",
+                            "attempts": attempts,
+                            "best_good": best_good,
+                            "zero_good_streak": zero_streak,
+                            "at": datetime.now(timezone.utc).isoformat(),
+                            "cycle": cycle,
+                        }
+                        failed.pop(key, None)
+                        msg = (
+                            f"  ∅ desistindo good={result['good']}/{args.max} "
+                            f"após {attempts} tentativas parciais "
+                            f"(best={best_good}) — marcado skipped"
+                        )
+                        print(msg, flush=True)
+                        file_log.log_console(msg)
+                    else:
+                        left = max_att - attempts if max_att > 0 else "∞"
+                        msg = (
+                            f"  ~ parcial good={result['good']}/{args.max} "
+                            f"attempt={attempts}/{max_att or '∞'} "
+                            f"(restam {left}) — re-tentará em outro ciclo"
+                        )
+                        print(msg, flush=True)
+                        file_log.log_console(msg)
+
+                visits[key] = visit_n + 1
                 cycle_hits += 1
                 jobs_done += 1
+                write_live(
+                    "nicho",
+                    {
+                        "phase": "idle",
+                        "last_elapsed_s": round(elapsed, 1),
+                        "last_good": result.get("good"),
+                        "ok": jobs_ok,
+                        "err": jobs_err,
+                    },
+                )
             except Exception as exc:
                 jobs_err += 1
                 jobs_done += 1
                 logger.exception("hunt_job_failed", niche=niche, city=city.label)
+                prev_fail = failed.get(key) or {}
+                attempts = int(prev_fail.get("attempts") or 0) + 1
                 failed[key] = {
                     "error": str(exc)[:300],
+                    "attempts": attempts,
                     "at": datetime.now(timezone.utc).isoformat(),
                 }
+                max_att = int(args.max_partial_attempts or 0)
+                give_up = max_att > 0 and attempts >= max_att
                 file_log.error(
                     {
                         "event": "job_error",
@@ -657,12 +806,38 @@ async def main() -> None:
                         "error_type": type(exc).__name__,
                         "cycle": cycle,
                         "job_key": key,
+                        "attempts": attempts,
+                        "gave_up": give_up,
                     }
                 )
-                print(f"  ✗ erro: {exc}", flush=True)
+                if give_up:
+                    completed[key] = {
+                        "campaign_id": prev_fail.get("campaign_id"),
+                        "good": int(prev_fail.get("best_good") or prev_fail.get("good") or 0),
+                        "full": False,
+                        "skipped": True,
+                        "skip_reason": "max_error_attempts",
+                        "attempts": attempts,
+                        "last_error": str(exc)[:300],
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "cycle": cycle,
+                    }
+                    failed.pop(key, None)
+                    print(
+                        f"  ✗ erro (desistindo após {attempts}x): {exc}",
+                        flush=True,
+                    )
+                else:
+                    print(f"  ✗ erro: {exc}", flush=True)
+                visits[key] = visit_n + 1
+                write_live(
+                    "nicho",
+                    {"phase": "erro", "err": jobs_err, "last_error": str(exc)[:160]},
+                )
 
             state["completed"] = completed
             state["failed"] = failed
+            state["visits"] = visits
             state["cursor"] = idx
             _save_state(state_path, state)
 
@@ -680,15 +855,27 @@ async def main() -> None:
         if args.once or _stop:
             break
 
-        pending = [
-            (n, c)
-            for n, c in jobs
-            if _job_key(n, c) not in completed
-            or (args.require_full and not completed.get(_job_key(n, c), {}).get("full"))
-        ]
-        if not pending and not args.redo:
-            file_log.summary("Fila completa — nada pendente. Encerrando.")
-            break
+        if args.skip_completed:
+            def _still_pending(n: str, c: CityTarget) -> bool:
+                k = _job_key(n, c)
+                if k not in completed:
+                    return True
+                meta = completed[k]
+                if meta.get("skipped"):
+                    return False
+                if args.require_full and not meta.get("full"):
+                    return True
+                return False
+
+            pending = [(n, c) for n, c in jobs if _still_pending(n, c)]
+            if not pending and not args.redo:
+                file_log.summary("Fila completa — nada pendente. Encerrando.")
+                break
+        else:
+            file_log.summary(
+                f"Ciclo {cycle} fechado — próxima volta busca leads novos "
+                f"(ignora empresa já cadastrada)."
+            )
 
         if args.cycle_pause > 0 and not _stop:
             msg = f"Pausa entre ciclos {args.cycle_pause}s…"
