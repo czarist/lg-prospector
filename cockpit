@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Sobe nicho + generalista + mailman e abre o painel.
+# Uso: ./cockpit   |   ./cockpit --attach   |   ./cockpit --stop
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PY="$ROOT/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PY="$(command -v python3)"
+else
+  echo "nenhum python encontrado (esperado: $ROOT/.venv/bin/python)" >&2
+  exit 127
+fi
+export PYTHONUNBUFFERED=1
+exec "$PY" "$ROOT/scripts/cockpit.py" "$@"
