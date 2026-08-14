@@ -41,12 +41,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.core.logging import get_logger, setup_logging
+from app.core.paths import logs_dir
 from app.domain.stages import ItemStageStatus
 from app.infrastructure.crm.client import CRMClient
 from app.infrastructure.crm.sync import sanitize_phone
 from app.infrastructure.database.models import Campaign, CampaignItem
 from app.infrastructure.database.session import async_session_factory, init_db, reset_engine
 from app.providers.email_enrichment import has_valid_email, verify_email_deliverable
+from app.providers.geo_email import classify_contact_email
 
 logger = get_logger(__name__)
 
@@ -64,6 +66,18 @@ def check_local(item: CampaignItem) -> dict:
         issues.append("sem_email")
     elif not has_valid_email(email):
         issues.append("email_sintaxe_invalida")
+    else:
+        extra = (co.extra if co else None) or {}
+        ok_geo, geo_reason = classify_contact_email(
+            email,
+            name=(ct.name if ct else "") or (co.name if co else "") or "",
+            city=(co.city if co else "") or "",
+            party=str(extra.get("tse_partido") or ""),
+            website=(co.website if co else "") or "",
+            segment=(co.segment if co else "") or "",
+        )
+        if not ok_geo:
+            issues.append(f"email_implausivel:{geo_reason}")
 
     name = (ct.name if ct else "") or (co.name if co else "") or ""
     if not name.strip() or name.strip() in {".", "-"}:
@@ -134,7 +148,11 @@ async def main() -> None:
         action="store_true",
         help="Itens com registro CRM ausente voltam para stage=enriched (re-sincroniza na próxima rodada de crm)",
     )
-    p.add_argument("--out", default="logs/data_quality_review.jsonl", help="Arquivo JSONL de saída")
+    p.add_argument(
+        "--out",
+        default=str(logs_dir() / "data_quality_review.jsonl"),
+        help="Arquivo JSONL de saída",
+    )
     args = p.parse_args()
 
     setup_logging()

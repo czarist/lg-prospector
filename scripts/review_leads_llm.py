@@ -26,6 +26,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import get_settings
 from app.core.logging import setup_logging, get_logger
+from app.core.paths import logs_dir
 from app.domain.stages import ItemStageStatus
 from app.infrastructure.database.models import Campaign, CampaignItem, Company, ItemStatus
 from app.infrastructure.database.session import async_session_factory, init_db, reset_engine
@@ -57,7 +58,7 @@ async def main() -> None:
     )
     p.add_argument(
         "--out",
-        default="logs/llm_review.jsonl",
+        default=str(logs_dir() / "llm_review.jsonl"),
         help="Arquivo JSONL de saída",
     )
     args = p.parse_args()
