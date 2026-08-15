@@ -11,6 +11,7 @@ q fecha o painel. Os processos continuam. --stop derruba.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import curses
 import json
 import os
@@ -18,6 +19,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,7 +69,7 @@ CMDS: dict[str, list[str]] = {
         "--pause", "8", "--cycle-pause", "60",
     ],
     "mailman": [
-        "--batch-size", "2", "--min-interval", "120", "--max-interval", "300",
+        "--batch-size", "4", "--min-interval", "120", "--max-interval", "300",
         "--cooldown-days", "4", "--wait-days", "4",
     ],
 }
@@ -161,15 +163,40 @@ def _tail_jsonl(path: Path, limit: int = 80) -> list[dict[str, Any]]:
     return out
 
 
+def _iter_jsonl(path: Path):
+    if not path.is_file():
+        return
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict):
+                    yield row
+    except OSError:
+        return
+
+
+def _is_local_today(raw: Any) -> bool:
+    ts = _parse_ts(raw)
+    if not ts:
+        return False
+    return ts.astimezone().date() == datetime.now().astimezone().date()
+
+
 def _hunt_avg() -> float:
-    day = datetime.now().strftime("%Y%m%d")
-    rows = _tail_jsonl(_hunt_results() / f"results_{day}.jsonl", 120)
-    elapsed = [
-        float(r["elapsed_s"])
-        for r in rows
-        if r.get("event") == "job_done" and r.get("elapsed_s")
-    ]
-    return _median(elapsed) or _AVG_HUNT_JOB
+    elapsed: list[float] = []
+    files = sorted(_hunt_results().glob("results_*.jsonl"))[-3:]
+    for path in files:
+        for row in _iter_jsonl(path):
+            if row.get("event") == "job_done" and row.get("elapsed_s"):
+                elapsed.append(float(row["elapsed_s"]))
+    return _median(elapsed[-120:]) or _AVG_HUNT_JOB
 
 
 def _gen_avg() -> float:
@@ -221,11 +248,28 @@ def _log_age(path: Path) -> float | None:
 
 
 def _today_hunt_stats() -> dict[str, Any]:
-    day = datetime.now().strftime("%Y%m%d")
-    rows = _tail_jsonl(_hunt_results() / f"results_{day}.jsonl", 200)
-    jobs = [r for r in rows if r.get("event") == "job_done"]
-    leads = sum(int(r.get("good") or 0) for r in jobs)
-    return {"jobs": len(jobs), "leads": leads}
+    """Soma job_done de hoje pelo timestamp — o hunt pode gravar no arquivo de ontem."""
+    jobs = 0
+    leads = 0
+    for path in _hunt_results().glob("results_*.jsonl"):
+        for row in _iter_jsonl(path):
+            if row.get("event") != "job_done" or not _is_local_today(row.get("ts")):
+                continue
+            jobs += 1
+            leads += int(row.get("good") or 0)
+    return {"jobs": jobs, "leads": leads}
+
+
+def _today_gen_stats() -> dict[str, Any]:
+    crm = 0
+    cycles = 0
+    for row in _iter_jsonl(_gen_jsonl()):
+        if row.get("event") != "cycle" or not _is_local_today(row.get("ts")):
+            continue
+        cycles += 1
+        etapa = ((row.get("result") or {}).get("etapa3_descoberta") or {})
+        crm += int(etapa.get("cadastradas_crm") or 0)
+    return {"cycles": cycles, "leads": crm}
 
 
 def _today_mail_stats() -> dict[str, Any]:
@@ -235,6 +279,100 @@ def _today_mail_stats() -> dict[str, Any]:
         "failed": int(live.get("failed_total") or 0),
         "batch": live.get("batch"),
     }
+
+
+def _lane(raw: Any) -> dict[str, int]:
+    src = raw if isinstance(raw, dict) else {}
+    return {
+        "sent": int(src.get("sent") or 0),
+        "ready": int(src.get("ready") or 0),
+        "waiting": int(src.get("waiting") or 0),
+        "cooldown": int(src.get("cooldown") or 0),
+        "total": int(src.get("total") or 0),
+    }
+
+
+def _forecast_from_live(live: dict[str, Any]) -> dict[str, Any]:
+    nested = live.get("forecast") if isinstance(live.get("forecast"), dict) else {}
+    nicho = nested.get("niche") if isinstance(nested, dict) else None
+    geral = nested.get("generalista") if isinstance(nested, dict) else None
+    if not nicho and live.get("nicho_total") is not None:
+        nicho = {
+            "sent": live.get("nicho_sent"),
+            "ready": live.get("nicho_ready"),
+            "waiting": 0,
+            "cooldown": live.get("nicho_cooldown"),
+            "total": live.get("nicho_total"),
+        }
+    if not geral and live.get("gen_total") is not None:
+        geral = {
+            "sent": live.get("gen_sent"),
+            "ready": live.get("gen_ready"),
+            "waiting": live.get("gen_waiting"),
+            "cooldown": live.get("gen_cooldown"),
+            "total": live.get("gen_total"),
+        }
+    return {"niche": _lane(nicho), "generalista": _lane(geral)}
+
+
+class ForecastWatch:
+    """Consulta a fila real no MySQL a cada 20s — não depende do lote do mailman."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._data: dict[str, Any] = {}
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="cockpit-forecast", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._data)
+
+    def wait_ready(self, timeout: float = 8.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.snapshot():
+                return
+            time.sleep(0.15)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                data = asyncio.run(self._fetch())
+                with self._lock:
+                    self._data = data
+            except Exception:
+                pass
+            if self._stop.wait(20):
+                break
+
+    async def _fetch(self) -> dict[str, Any]:
+        from app.infrastructure.database.session import (
+            async_session_factory,
+            dispose_db,
+            init_db,
+            reset_engine,
+        )
+        from app.services.mailman_service import MailmanService
+
+        reset_engine()
+        await init_db()
+        try:
+            factory = async_session_factory()
+            async with factory() as session:
+                return await MailmanService(session).forecast()
+        finally:
+            await dispose_db()
 
 
 def _pipeline(phase: str, stages: tuple[str, ...] = ("discover", "enrich", "crm")) -> str:
@@ -351,12 +489,13 @@ def _put(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
         pass
 
 
-def _snapshot() -> dict[str, Any]:
+def _snapshot(forecast: dict[str, Any] | None = None) -> dict[str, Any]:
     hunt_jobs, gen_cities = _queue_totals()
     hunt_avg = _hunt_avg()
     gen_avg = _gen_avg()
     now = _now()
     workers: dict[str, dict[str, Any]] = {}
+    snap_forecast = forecast if forecast and (forecast.get("niche") or forecast.get("generalista")) else None
 
     for name, script in SCRIPTS.items():
         pids = [p for p in find_pids(script.name) if _alive(p)]
@@ -451,12 +590,46 @@ def _snapshot() -> dict[str, Any]:
             until = (next_at - now).total_seconds() if next_at else None
             if until is not None:
                 until = max(0.0, until)
+            fc = snap_forecast or _forecast_from_live(live)
+            n = _lane((fc or {}).get("niche"))
+            g = _lane((fc or {}).get("generalista"))
+            has_fc = bool(n["total"] or g["total"])
+            if has_fc:
+                label = (
+                    f"nicho {n['sent']}/{n['total']} enviados"
+                    f"   geral {g['sent']}/{g['total']} enviados"
+                )
+                detail = (
+                    f"prontos nicho {n['ready']}  geral {g['ready']}"
+                    + (f"  libera 4d {g['waiting']}" if g["waiting"] else "")
+                    + (
+                        f"  cooldown {n['cooldown']}+{g['cooldown']}"
+                        if (n["cooldown"] or g["cooldown"])
+                        else ""
+                    )
+                )
+            else:
+                label = live.get("last_line") or "avaliando fila"
+                detail = (
+                    f"fila vazia  nicho {live.get('niche_n', '—')}  "
+                    f"gen {live.get('gen_n', '—')}"
+                    if live.get("picked") == 0
+                    and (live.get("niche_n") is not None or live.get("gen_n") is not None)
+                    else (
+                        f"fila {live.get('candidates') if live.get('candidates') is not None else '—'}"
+                        + (
+                            f"  nicho {live.get('niche_n')}  gen {live.get('gen_n')}"
+                            if live.get("niche_n") is not None
+                            else ""
+                        )
+                    )
+                )
             row.update(
                 {
                     "title": "MAILMAN",
-                    "label": live.get("last_line") or "avaliando fila",
+                    "label": label,
                     "phase": live.get("phase") or ("rodando" if running else "parado"),
-                    "pipeline": "1 nicho + 1 generalista",
+                    "pipeline": "2+2, completa com a outra faixa  ·  nicho também recebe o geral",
                     "progress": f"lote {live.get('batch')}" if live.get("batch") else "lote —",
                     "cycle": None,
                     "pct": None,
@@ -465,41 +638,47 @@ def _snapshot() -> dict[str, Any]:
                     "overtime": False,
                     "eta_cycle": None,
                     "avg": _AVG_MAIL_GAP,
-                    "detail": (
-                        f"sem par  nicho {live.get('niche_n', '—')}  "
-                        f"gen {live.get('gen_n', '—')}"
-                        if live.get("picked") == 0
-                        and (live.get("niche_n") is not None or live.get("gen_n") is not None)
-                        else (
-                            f"fila {live.get('candidates') if live.get('candidates') is not None else '—'}"
-                            + (
-                                f"  nicho {live.get('niche_n')}  gen {live.get('gen_n')}"
-                                if live.get("niche_n") is not None
-                                else ""
-                            )
-                        )
-                    ),
+                    "detail": detail,
                     "last": (
-                        f"enviados {live.get('sent_total') or 0}  "
+                        f"{live.get('last_line') or ''}  "
+                        f"sessão {live.get('sent_total') or 0}  "
                         f"falha {live.get('failed_total') or 0}  "
                         f"pausa 2–5 min"
-                    ),
+                    ).strip(),
+                    "forecast": fc,
                 }
             )
         workers[name] = row
 
     hunt = _today_hunt_stats()
+    gen = _today_gen_stats()
     mail = _today_mail_stats()
+    live_mail = read_live("mailman")
+    fc = snap_forecast or _forecast_from_live(live_mail)
     return {
         "workers": workers,
         "today_jobs": hunt["jobs"],
         "today_leads": hunt["leads"],
+        "today_gen_leads": gen["leads"],
         "mail_sent": mail["sent"],
+        "forecast": fc,
     }
 
 
 def _hline(width: int) -> str:
     return "─" * max(0, width)
+
+
+def _header_mail(snap: dict[str, Any]) -> str:
+    fc = snap.get("forecast") or {}
+    n = _lane(fc.get("niche"))
+    g = _lane(fc.get("generalista"))
+    if n["total"] or g["total"]:
+        return (
+            f"mailman nicho {n['sent']}/{n['total']}  "
+            f"geral {g['sent']}/{g['total']}"
+        )
+    return f"{snap.get('mail_sent') or 0} e-mails mailman"
 
 
 def _svc_mark(svc: dict[str, Any] | None) -> str:
@@ -508,28 +687,189 @@ def _svc_mark(svc: dict[str, Any] | None) -> str:
     return "●" if svc.get("ok") else "○"
 
 
+def _fmt_temp(c: float | None) -> str:
+    if c is None:
+        return "—°C"
+    return f"{c:.0f}°C"
+
+
+def _fmt_ghz(mhz: float | None) -> str:
+    if not mhz:
+        return "—"
+    if mhz >= 1000:
+        return f"{mhz / 1000:.2f} GHz"
+    return f"{mhz:.0f} MHz"
+
+
+def _fmt_uptime(seconds: float | None) -> str:
+    if not seconds:
+        return "—"
+    sec = int(seconds)
+    d, rem = divmod(sec, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h{m:02d}"
+    return f"{m} min"
+
+
+def _core_bar(cores: list[float], width: int | None = None) -> str:
+    if not cores:
+        return ""
+    n = len(cores)
+    w = width or n
+    if n > w:
+        step = n / w
+        cells = [max(cores[int(i * step) : int((i + 1) * step)] or [0]) for i in range(w)]
+    else:
+        cells = cores
+    out = []
+    for u in cells:
+        if u >= 70:
+            out.append("█")
+        elif u >= 35:
+            out.append("▓")
+        elif u >= 8:
+            out.append("▒")
+        else:
+            out.append("░")
+    return "".join(out)
+
+
 def _disk_bit(label: str, info: dict[str, Any] | None) -> str:
     if not info:
         return f"{label} —"
+    model = (info.get("model") or "").strip()
+    kind = info.get("kind") or ("hdd" if info.get("rota") else "ssd")
+    extra = f"  {model}" if model else (f"  {kind}" if kind else "")
     return (
         f"{label} {info['pct']:.0f}% "
-        f"{_fmt_bytes(info['used'])}/{_fmt_bytes(info['total'])}"
+        f"{_fmt_bytes(info['used'])}/{_fmt_bytes(info['total'])}{extra}"
     )
+
+
+def _host_line(machine: dict[str, Any]) -> str:
+    host = machine.get("host") or {}
+    bits = [
+        host.get("hostname") or "host",
+        host.get("os") or "",
+        (host.get("kernel") or "").split("-")[0],
+        f"up {_fmt_uptime(host.get('uptime'))}",
+    ]
+    return "  ·  ".join(b for b in bits if b)
+
+
+def _cpu_line(machine: dict[str, Any]) -> str:
+    info = machine.get("cpu_info") or {}
+    freq = machine.get("cpu_freq") or {}
+    temp = machine.get("cpu_temp") or {}
+    cores = machine.get("cpu_cores") or []
+    pct = machine.get("cpu")
+    active = machine.get("cpu_active")
+    n = info.get("threads") or len(cores) or 0
+    bits = [
+        f"cpu  {info.get('model') or '—'}",
+        f"{info.get('cores') or '?'}c/{n}t",
+    ]
+    if active is not None and n:
+        bits.append(f"{active}/{n} ativos")
+    if cores:
+        bits.append(_core_bar(cores))
+    bits.append(f"{pct:.0f}%" if pct is not None else "…%")
+    if freq.get("avg_mhz"):
+        cap = f"/{_fmt_ghz(info.get('max_mhz'))}" if info.get("max_mhz") else ""
+        bits.append(f"{_fmt_ghz(freq.get('avg_mhz'))}{cap}")
+    if info.get("governor"):
+        bits.append(info["governor"])
+    if temp.get("package") is not None:
+        bits.append(_fmt_temp(temp.get("package")))
+    return "  ".join(str(b) for b in bits if b)
+
+
+def _ram_line(machine: dict[str, Any]) -> str:
+    ram = machine.get("ram") or {}
+    load = machine.get("load") or (0, 0, 0)
+    bits = []
+    if ram.get("total"):
+        bits.append(
+            f"ram  {_fmt_bytes(ram.get('used'))}/{_fmt_bytes(ram.get('total'))} "
+            f"({ram.get('pct', 0):.0f}%)"
+        )
+    if ram.get("cached"):
+        bits.append(f"cache {_fmt_bytes(ram.get('cached'))}")
+    if ram.get("swap_total"):
+        bits.append(
+            f"swap {_fmt_bytes(ram.get('swap_used'))}/{_fmt_bytes(ram.get('swap_total'))}"
+        )
+    bits.append(f"load {load[0]:.2f} {load[1]:.2f} {load[2]:.2f}")
+    return "   ".join(bits)
+
+
+def _gpu_line(machine: dict[str, Any]) -> str:
+    gpu = machine.get("gpu") or {}
+    igpu = machine.get("igpu") or {}
+    if not gpu:
+        return "gpu  —"
+    bits = [
+        f"gpu  {gpu.get('name') or '—'}",
+        f"{gpu.get('util', 0):.0f}%",
+        f"vram {_fmt_bytes(gpu.get('mem_used'))}/{_fmt_bytes(gpu.get('mem_total'))}",
+    ]
+    if gpu.get("temp") is not None:
+        bits.append(_fmt_temp(gpu.get("temp")))
+    if gpu.get("sclk_mhz"):
+        bits.append(f"sclk {gpu['sclk_mhz']:.0f}M")
+    if gpu.get("mclk_mhz"):
+        bits.append(f"mclk {gpu['mclk_mhz']:.0f}M")
+    if gpu.get("power_w") is not None:
+        cap = f"/{gpu['power_cap_w']:.0f}W" if gpu.get("power_cap_w") else "W"
+        bits.append(f"{gpu['power_w']:.0f}{cap}" if gpu.get("power_cap_w") else f"{gpu['power_w']:.0f}W")
+    if gpu.get("fan_rpm") is not None:
+        bits.append(f"fan {int(gpu['fan_rpm'])}")
+    elif gpu.get("fan_pct") is not None:
+        bits.append(f"fan {gpu['fan_pct']:.0f}%")
+    if gpu.get("pcie"):
+        bits.append(gpu["pcie"])
+    if igpu.get("name"):
+        bits.append(f"igpu {igpu['name']}")
+    return "  ".join(str(b) for b in bits)
+
+
+def _board_line(machine: dict[str, Any]) -> str:
+    board = machine.get("board") or {}
+    name = " ".join(x for x in (board.get("vendor"), board.get("name")) if x) or "—"
+    bits = [f"mb   {name}"]
+    if board.get("bios"):
+        date = f" · {board['bios_date']}" if board.get("bios_date") else ""
+        bits.append(f"BIOS {board['bios']}{date}")
+    return "   ".join(bits)
 
 
 def _machine_line(machine: dict[str, Any]) -> str:
     cpu = machine.get("cpu")
+    info = machine.get("cpu_info") or {}
+    freq = machine.get("cpu_freq") or {}
+    temp = machine.get("cpu_temp") or {}
     ram = machine.get("ram") or {}
-    gpu = machine.get("gpu")
+    gpu = machine.get("gpu") or {}
     load = machine.get("load") or (0, 0, 0)
     bits = []
-    bits.append(f"cpu {cpu:.0f}%" if cpu is not None else "cpu …")
+    model = info.get("model") or "cpu"
+    bits.append(f"{model}")
+    bits.append(f"{cpu:.0f}%" if cpu is not None else "cpu …")
+    if freq.get("avg_mhz"):
+        bits.append(_fmt_ghz(freq.get("avg_mhz")))
+    if temp.get("package") is not None:
+        bits.append(_fmt_temp(temp.get("package")))
     if ram.get("total"):
         bits.append(f"ram {_fmt_bytes(ram.get('used'))}/{_fmt_bytes(ram.get('total'))} ({ram.get('pct', 0):.0f}%)")
     if gpu:
-        bits.append(f"gpu {gpu.get('util', 0):.0f}%  vram {_fmt_bytes(gpu.get('mem_used'))}/{_fmt_bytes(gpu.get('mem_total'))}")
-    else:
-        bits.append("gpu 0%")
+        g = f"gpu {gpu.get('name') or ''} {gpu.get('util', 0):.0f}%"
+        if gpu.get("temp") is not None:
+            g += f" {_fmt_temp(gpu.get('temp'))}"
+        bits.append(g.strip())
     bits.append(f"load {load[0]:.1f}")
     return "   ".join(bits)
 
@@ -543,6 +883,28 @@ def _disks_line(machine: dict[str, Any]) -> str:
             _disk_bit("hd", disks.get("hd")),
         ]
     )
+
+
+def _machine_is_hot(machine: dict[str, Any]) -> bool:
+    cpu = machine.get("cpu") or 0
+    ram_pct = (machine.get("ram") or {}).get("pct") or 0
+    disk_pct = ((machine.get("disks") or {}).get("principal") or {}).get("pct") or 0
+    cpu_t = (machine.get("cpu_temp") or {}).get("package") or 0
+    gpu_t = (machine.get("gpu") or {}).get("temp") or 0
+    return cpu >= 85 or ram_pct >= 85 or disk_pct >= 90 or cpu_t >= 80 or gpu_t >= 85
+
+
+def _machine_lines(machine: dict[str, Any], *, full: bool) -> list[str]:
+    if full:
+        return [
+            _host_line(machine),
+            _cpu_line(machine),
+            _ram_line(machine),
+            _gpu_line(machine),
+            _board_line(machine),
+            _disks_line(machine),
+        ]
+    return [_machine_line(machine), _disks_line(machine)]
 
 
 def _services_line(services: dict[str, Any]) -> str:
@@ -560,29 +922,22 @@ def _services_line(services: dict[str, Any]) -> str:
     return "   ".join(parts)
 
 
-def _draw_infra(stdscr: Any, y: int, w: int, health: dict[str, Any]) -> int:
+def _draw_infra(stdscr: Any, y: int, w: int, health: dict[str, Any], *, full: bool) -> int:
     machine = health.get("machine") or {}
     services = health.get("services") or {}
     inner = max(20, w - 4)
-    cpu = machine.get("cpu")
-    ram_pct = (machine.get("ram") or {}).get("pct") or 0
-    disk_pct = ((machine.get("disks") or {}).get("root") or {}).get("pct") or 0
-    hot = (cpu or 0) >= 85 or ram_pct >= 85 or disk_pct >= 90
+    hot = _machine_is_hot(machine)
     color = curses.color_pair(5) if hot else curses.color_pair(4)
-    line1 = _machine_line(machine)
     _put(stdscr, y, 1, "┌─ MÁQUINA ", color | curses.A_BOLD)
     rest = inner - 10
     if rest > 2:
         _put(stdscr, y, 12, _hline(rest) + "┐", color)
     y += 1
+    for line in _machine_lines(machine, full=full):
+        _put(stdscr, y, 1, "│", color)
+        _put(stdscr, y, 3, line[: inner - 2], color)
+        y += 1
     _put(stdscr, y, 1, "│", color)
-    _put(stdscr, y, 3, line1[: inner - 2], color)
-    y += 1
-    _put(stdscr, y, 1, "│", color)
-    _put(stdscr, y, 3, _disks_line(machine)[: inner - 2], color)
-    y += 1
-    _put(stdscr, y, 1, "│", color)
-    # pinta cada serviço
     x = 3
     order = ("mysql", "redis", "qwen", "crm", "site")
     for key in order:
@@ -629,10 +984,14 @@ def _draw_card(stdscr: Any, y: int, w: int, row: dict[str, Any]) -> int:
         _put(stdscr, y, 4 + len(head), _hline(rest) + "┐", color)
     y += 1
 
+    label = str(row.get("label") or "")
+    pipe = str(row.get("pipeline") or phase) if phase else ""
+    pipe_x = min(w - 22, 44)
+    wrap_pipe = bool(pipe) and (3 + len(label) + 2 > pipe_x)
     _put(stdscr, y, 1, "│", color)
-    _put(stdscr, y, 3, str(row.get("label") or ""), curses.A_BOLD)
-    if phase:
-        _put(stdscr, y, min(w - 22, 44), str(row.get("pipeline") or phase), curses.color_pair(4))
+    _put(stdscr, y, 3, label, curses.A_BOLD)
+    if pipe and not wrap_pipe:
+        _put(stdscr, y, pipe_x, pipe, curses.color_pair(4))
     y += 1
 
     _put(stdscr, y, 1, "│", color)
@@ -649,12 +1008,16 @@ def _draw_card(stdscr: Any, y: int, w: int, row: dict[str, Any]) -> int:
         bar_w = min(18, max(8, w - 56))
         volta = f"  volta {_fmt_dur(row.get('eta_cycle'))}" if alive else ""
         line = f"{timing}  {_bar(float(row['pct']), bar_w)} {float(row['pct']):4.1f}%{volta}"
+        if wrap_pipe:
+            line = f"{pipe}   {line}"
         _put(stdscr, y, 3, line, curses.color_pair(5) if overtime else curses.color_pair(4))
     else:
         if alive and row.get("remain") is not None:
             timing = f"próximo lote em {_fmt_dur(row.get('remain'))}   {row.get('detail') or ''}"
         else:
             timing = "parado"
+        if wrap_pipe:
+            timing = f"{pipe}   {timing}"
         _put(stdscr, y, 3, timing, curses.color_pair(4))
     y += 1
 
@@ -700,9 +1063,11 @@ def _draw(stdscr: Any, boot_at: float) -> None:
 
     watch = HealthWatch()
     watch.start()
+    forecast_watch = ForecastWatch()
+    forecast_watch.start()
     try:
         while not _stop:
-            snap = _snapshot()
+            snap = _snapshot(forecast_watch.snapshot())
             health = watch.snapshot()
             h, w = stdscr.getmaxyx()
             stdscr.erase()
@@ -722,13 +1087,16 @@ def _draw(stdscr: Any, boot_at: float) -> None:
                 1,
                 1,
                 f" hoje  {snap['today_jobs']} jobs nicho   +{snap['today_leads']} leads   "
-                f"{snap['mail_sent']} e-mails mailman",
+                f"gen +{snap['today_gen_leads']}   "
+                f"{_header_mail(snap)}",
                 curses.color_pair(4),
             )
 
             y = 3
-            if h >= 28:
-                y = _draw_infra(stdscr, y, w, health)
+            if h >= 32:
+                y = _draw_infra(stdscr, y, w, health, full=True)
+            elif h >= 28:
+                y = _draw_infra(stdscr, y, w, health, full=False)
 
             for key in ("nicho", "generalista", "mailman"):
                 if y + 6 > h - 1:
@@ -737,7 +1105,7 @@ def _draw(stdscr: Any, boot_at: float) -> None:
 
             if h < 28:
                 m = health.get("machine") or {}
-                _put(stdscr, h - 2, 1, (_machine_line(m) + "  " + _disks_line(m))[: w - 2], curses.color_pair(4))
+                _put(stdscr, h - 2, 1, _machine_line(m)[: w - 2], curses.color_pair(4))
                 _put(stdscr, h - 1, 1, _services_line(health.get("services") or {})[: w - 2])
             else:
                 _put(
@@ -756,22 +1124,27 @@ def _draw(stdscr: Any, boot_at: float) -> None:
                 break
     finally:
         watch.stop()
+        forecast_watch.stop()
 
 
 def _print_snapshot() -> None:
     watch = HealthWatch()
     watch.start()
-    time.sleep(1.3)
+    forecast_watch = ForecastWatch()
+    forecast_watch.start()
+    forecast_watch.wait_ready(8.0)
     health = watch.snapshot()
+    snap = _snapshot(forecast_watch.snapshot())
     watch.stop()
-    snap = _snapshot()
+    forecast_watch.stop()
     print(
         f"LG v{__version__}  {snap['today_jobs']} jobs  +{snap['today_leads']} leads  "
-        f"{snap['mail_sent']} e-mails",
+        f"gen +{snap['today_gen_leads']}  {_header_mail(snap)}",
         flush=True,
     )
-    print(_machine_line(health.get("machine") or {}), flush=True)
-    print(_disks_line(health.get("machine") or {}), flush=True)
+    machine = health.get("machine") or {}
+    for line in _machine_lines(machine, full=True):
+        print(line, flush=True)
     print(_services_line(health.get("services") or {}), flush=True)
     for key in ("nicho", "generalista", "mailman"):
         row = snap["workers"][key]
@@ -781,7 +1154,8 @@ def _print_snapshot() -> None:
             note = "passou da média" if row.get("overtime") else f"faltam {_fmt_dur(row.get('remain'))}"
             print(f"    neste {_fmt_clock(row['spent'])}  {note}  {row.get('detail') or ''}", flush=True)
         elif row.get("remain") is not None:
-            print(f"    próximo {_fmt_dur(row['remain'])}  {row.get('last') or ''}", flush=True)
+            extra = row.get("detail") or row.get("last") or ""
+            print(f"    próximo {_fmt_dur(row['remain'])}  {extra}", flush=True)
         if row.get("last_log"):
             print(f"    {row['last_log'][:100]}", flush=True)
 
