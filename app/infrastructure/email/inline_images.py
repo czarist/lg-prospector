@@ -78,31 +78,23 @@ def _svg_viewport(svg_bytes: bytes) -> tuple[int, int]:
 
 
 def flatten_png(png_bytes: bytes, *, bg: tuple[int, int, int] | None = None) -> bytes:
-    """PNG com transparência vira RGB opaco — Gmail/Outlook não 'comem' o ícone."""
+    """Reencode PNG. Keeps alpha unless an explicit `bg` is given to flatten onto."""
     from io import BytesIO
 
     from PIL import Image
 
     im = Image.open(BytesIO(png_bytes)).convert("RGBA")
     alpha = im.getchannel("A")
-    if alpha.getextrema() == (255, 255):
-        out = BytesIO()
-        im.convert("RGB").save(out, format="PNG", optimize=True)
-        return out.getvalue()
-
-    # fundo: se o desenho é claro, usa escuro; se é escuro/verde, usa branco
+    out = BytesIO()
     if bg is None:
-        samples = list(im.getdata())
-        opaque = [px for px in samples[:: max(1, len(samples) // 400)] if px[3] > 40]
-        if opaque:
-            lum = sum(0.299 * r + 0.587 * g + 0.114 * b for r, g, b, _a in opaque) / len(opaque)
-            bg = (11, 18, 16) if lum > 180 else (255, 255, 255)
+        if alpha.getextrema() == (255, 255):
+            im.convert("RGB").save(out, format="PNG", optimize=True)
         else:
-            bg = (255, 255, 255)
+            im.save(out, format="PNG", optimize=True)
+        return out.getvalue()
 
     canvas = Image.new("RGB", im.size, bg)
     canvas.paste(im, mask=alpha)
-    out = BytesIO()
     canvas.save(out, format="PNG", optimize=True)
     return out.getvalue()
 
