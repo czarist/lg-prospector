@@ -1,8 +1,8 @@
 """Mailman — disparo de e-mail desacoplado da prospecção.
 
 Hunts só cadastram leads. Este serviço avalia quem ainda não recebeu
-e-mail nos últimos N dias e envia em pares fixos — 1 nicho + 1
-generalista — com pausa aleatória longa entre lotes.
+e-mail nos últimos N dias e envia em lotes de 4 — prefere 2 nicho + 2 generalista e completa
+com a faixa que ainda tiver gente. Nunca para por falta de um lado.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -132,10 +132,12 @@ class MailmanService:
             overfetch=max(80, size * 40),
             persist_rejects=not dry_run,
         )
-        require_pair = only is None and size >= 2
-        picked = self.pick_batch(pool, size, require_pair=require_pair)
+        prefer_mix = only is None and size >= 2
+        picked = self.pick_batch(pool, size, prefer_mix=prefer_mix)
         niche_n = sum(1 for t in pool if t.lane == "niche")
         gen_n = sum(1 for t in pool if t.lane == "generalista")
+        picked_niche = sum(1 for t in picked if t.lane == "niche")
+        picked_gen = sum(1 for t in picked if t.lane == "generalista")
         results: list[dict[str, Any]] = []
         sent = failed = skipped = 0
         provider_blocked = False
@@ -167,16 +169,14 @@ class MailmanService:
                 cooldown_days=cooldown,
                 wait_days=wait,
             )
-            # par 1+1: se o escolhido pular, tenta outro da mesma faixa
+            # se o escolhido pular, tenta outro da mesma faixa; se acabar, completa com a outra
             tries = 0
             while (
                 outcome.get("outcome") == "skip"
                 and tries < 8
             ):
-                alt = self._next_diverse(
-                    [t for t in unused if t.lane == target.lane],
-                    used,
-                )
+                same = [t for t in unused if t.lane == target.lane]
+                alt = self._next_diverse(same, used) or self._next_diverse(unused, used)
                 if alt is None:
                     break
                 unused = [t for t in unused if t.email != alt.email]
@@ -187,6 +187,7 @@ class MailmanService:
                     skipped=target.email,
                     reason=outcome.get("reason"),
                     retry=alt.email,
+                    retry_lane=alt.lane,
                 )
                 outcome = await self.send_target(
                     alt,
@@ -225,11 +226,14 @@ class MailmanService:
             "niche": niche_n,
             "generalista": gen_n,
             "picked": len(picked),
+            "picked_niche": picked_niche,
+            "picked_gen": picked_gen,
             "quota_paused": False,
             "provider_blocked": provider_blocked,
             "dry_run": dry_run,
             "cooldown_days": cooldown,
             "results": results,
+            "forecast": await self.forecast(cooldown_days=cooldown, wait_days=wait),
         }
         logger.info(
             "mailman_batch_done",
@@ -240,6 +244,8 @@ class MailmanService:
             niche=niche_n,
             generalista=gen_n,
             picked=len(picked),
+            picked_niche=picked_niche,
+            picked_gen=picked_gen,
             blocked=provider_blocked,
         )
         return summary
@@ -275,6 +281,7 @@ class MailmanService:
             }
             for t in pool[:limit]
         ]
+        forecast = await self.forecast(cooldown_days=cooldown, wait_days=wait)
         return {
             "candidates": len(pool),
             "niche": niche_n,
@@ -282,7 +289,191 @@ class MailmanService:
             "cooldown_days": cooldown,
             "wait_days": wait,
             "sample": sample,
+            "forecast": forecast,
         }
+
+    async def forecast(
+        self,
+        *,
+        cooldown_days: int | None = None,
+        wait_days: int | None = None,
+    ) -> dict[str, Any]:
+        """Previsão da fila: enviados / total, prontos agora e espera de 4 dias.
+
+        Nicho e geral são modalidades independentes no mesmo lead:
+        - lead de nicho entra nas duas filas (template do nicho + o geral)
+        - lead só-geral não entra na fila de nicho
+        - político/partido ficam de fora do template geral (e-mail de negócio)
+        Total cresce com cadastro novo; "prontos" sobe quando vence a espera
+        de `wait_days` (só descoberta generalista) e quando sai do cooldown.
+        """
+        settings = get_settings()
+        cooldown = int(
+            cooldown_days if cooldown_days is not None else settings.email_cooldown_days
+        )
+        wait = int(wait_days if wait_days is not None else settings.email_cooldown_days)
+        now = _utcnow()
+        wait_cutoff = now - timedelta(days=max(0, wait))
+        cool_since = now - timedelta(days=max(0, cooldown))
+        recent = self._email_exists(statuses=("sent", "dry_run"), since=cool_since)
+        bounced = self._email_exists(statuses=("bounced",))
+        sent_gen = self._email_exists(
+            templates=(TEMPLATE_FILE,),
+            statuses=("sent", "dry_run"),
+        )
+        excluded = list(_EXCLUDED_SEGMENTS)
+        niche_stages = (
+            ItemStageStatus.CRM_SYNCED.value,
+            ItemStageStatus.SENT.value,
+            ItemStageStatus.QUEUED.value,
+        )
+
+        niche_total = await self._count(
+            select(func.count(CampaignItem.id))
+            .join(Campaign, CampaignItem.campaign_id == Campaign.id)
+            .join(Contact, CampaignItem.contact_id == Contact.id)
+            .where(
+                func.lower(Campaign.niche) != GENERALIST_NICHE,
+                Contact.email.is_not(None),
+                Contact.email != "",
+                CampaignItem.stage.in_(niche_stages),
+            )
+        )
+        niche_sent = await self._count(
+            select(func.count(CampaignItem.id))
+            .join(Campaign, CampaignItem.campaign_id == Campaign.id)
+            .join(Contact, CampaignItem.contact_id == Contact.id)
+            .where(
+                func.lower(Campaign.niche) != GENERALIST_NICHE,
+                Contact.email.is_not(None),
+                Contact.email != "",
+                CampaignItem.stage.in_(niche_stages),
+                or_(
+                    CampaignItem.stage == ItemStageStatus.SENT.value,
+                    CampaignItem.email_sent_at.is_not(None),
+                ),
+            )
+        )
+        niche_ready = await self._count(
+            select(func.count(CampaignItem.id))
+            .join(Campaign, CampaignItem.campaign_id == Campaign.id)
+            .join(Contact, CampaignItem.contact_id == Contact.id)
+            .where(
+                func.lower(Campaign.niche) != GENERALIST_NICHE,
+                Contact.email.is_not(None),
+                Contact.email != "",
+                CampaignItem.stage == ItemStageStatus.CRM_SYNCED.value,
+                ~recent,
+                ~bounced,
+            )
+        )
+        niche_left = max(0, niche_total - niche_sent)
+        niche_cooldown = max(0, niche_left - niche_ready)
+
+        has_email = (
+            Contact.email.is_not(None),
+            Contact.email != "",
+            or_(Company.segment.is_(None), Company.segment.notin_(excluded)),
+        )
+        in_geral = or_(
+            and_(Contact.crm_id.is_not(None), Contact.crm_id != ""),
+            Company.source == ORIGIN,
+        )
+        gen_total = await self._count(
+            select(func.count(Contact.id))
+            .join(Company, Contact.company_id == Company.id)
+            .where(*has_email, in_geral)
+        )
+        gen_sent = await self._count(
+            select(func.count(Contact.id))
+            .join(Company, Contact.company_id == Company.id)
+            .where(*has_email, in_geral, sent_gen)
+        )
+        gen_waiting = await self._count(
+            select(func.count(Contact.id))
+            .join(Company, Contact.company_id == Company.id)
+            .where(
+                *has_email,
+                Company.source == ORIGIN,
+                Company.created_at > wait_cutoff,
+                ~sent_gen,
+            )
+        )
+        gen_ready_exist = await self._count(
+            select(func.count(Contact.id))
+            .join(Company, Contact.company_id == Company.id)
+            .where(
+                *has_email,
+                Contact.crm_id.is_not(None),
+                Contact.crm_id != "",
+                or_(
+                    Company.source.is_(None),
+                    Company.source != ORIGIN,
+                    func.coalesce(Company.source, "") == "",
+                ),
+                ~sent_gen,
+                ~recent,
+                ~bounced,
+            )
+        )
+        gen_ready_mature = await self._count(
+            select(func.count(Contact.id))
+            .join(Company, Contact.company_id == Company.id)
+            .where(
+                *has_email,
+                Company.source == ORIGIN,
+                Company.created_at <= wait_cutoff,
+                ~sent_gen,
+                ~recent,
+                ~bounced,
+            )
+        )
+        gen_ready = gen_ready_exist + gen_ready_mature
+        gen_left = max(0, gen_total - gen_sent)
+        gen_cooldown = max(0, gen_left - gen_ready - gen_waiting)
+
+        return {
+            "cooldown_days": cooldown,
+            "wait_days": wait,
+            "niche": {
+                "sent": niche_sent,
+                "ready": niche_ready,
+                "waiting": 0,
+                "cooldown": niche_cooldown,
+                "total": niche_total,
+            },
+            "generalista": {
+                "sent": gen_sent,
+                "ready": gen_ready,
+                "waiting": gen_waiting,
+                "cooldown": gen_cooldown,
+                "total": gen_total,
+            },
+        }
+
+    async def _count(self, stmt) -> int:
+        return int((await self.session.execute(stmt)).scalar() or 0)
+
+    def _email_exists(
+        self,
+        *,
+        statuses: tuple[str, ...],
+        templates: tuple[str, ...] | None = None,
+        since: datetime | None = None,
+    ):
+        clauses: list[Any] = [EmailRecord.status.in_(list(statuses))]
+        if templates:
+            clauses.append(EmailRecord.template_name.in_(list(templates)))
+        if since is not None:
+            clauses.append(EmailRecord.sent_at.is_not(None))
+            clauses.append(EmailRecord.sent_at >= since)
+        clauses.append(
+            or_(
+                EmailRecord.contact_id == Contact.id,
+                func.lower(EmailRecord.to_address) == func.lower(Contact.email),
+            )
+        )
+        return exists(select(EmailRecord.id).where(*clauses))
 
     async def collect_targets(
         self,
@@ -341,13 +532,17 @@ class MailmanService:
         pool: list[MailTarget],
         size: int,
         *,
-        require_pair: bool = True,
+        prefer_mix: bool = True,
+        require_pair: bool | None = None,
     ) -> list[MailTarget]:
-        """Lote padrão: exatamente 1 nicho + 1 generalista.
+        """Lote de `size` envios. Prefere metade/metade (2+2) e completa
+        com a faixa que ainda tiver gente — 1+3, 0+4, 3+1, 4+0.
 
-        Sem um de cada (ou o par cai no mesmo e-mail/domínio), não dispara.
-        `require_pair=False` só no `--only` (uma faixa).
+        Só devolve vazio se o pool inteiro estiver seco. `prefer_mix=False`
+        no `--only` (uma faixa).
         """
+        if require_pair is not None:
+            prefer_mix = require_pair
         if not pool or size <= 0:
             return []
         niche = [t for t in pool if t.lane == "niche"]
@@ -355,26 +550,43 @@ class MailmanService:
         random.shuffle(niche)
         random.shuffle(gen)
 
-        if require_pair:
-            if not niche or not gen:
-                return []
-            a = self._next_diverse(niche, [])
-            if not a:
-                return []
-            b = self._next_diverse(gen, [a])
-            if not b:
-                return []
-            pair = [a, b]
-            random.shuffle(pair)
-            return pair
+        if not prefer_mix:
+            lane = niche or gen
+            chosen: list[MailTarget] = []
+            while len(chosen) < size:
+                nxt = self._next_diverse(lane, chosen)
+                if nxt is None:
+                    break
+                chosen.append(nxt)
+            return chosen
 
-        lane = niche or gen
+        per_lane = max(1, size // 2)
         chosen: list[MailTarget] = []
+        n_got = g_got = 0
+        while n_got < per_lane or g_got < per_lane:
+            progressed = False
+            if n_got < per_lane:
+                nxt = self._next_diverse(niche, chosen)
+                if nxt:
+                    chosen.append(nxt)
+                    n_got += 1
+                    progressed = True
+            if g_got < per_lane:
+                nxt = self._next_diverse(gen, chosen)
+                if nxt:
+                    chosen.append(nxt)
+                    g_got += 1
+                    progressed = True
+            if not progressed:
+                break
+
+        # improviso: o que faltou de uma faixa sai da outra
         while len(chosen) < size:
-            nxt = self._next_diverse(lane, chosen)
+            nxt = self._next_diverse(niche, chosen) or self._next_diverse(gen, chosen)
             if nxt is None:
                 break
             chosen.append(nxt)
+        random.shuffle(chosen)
         return chosen
 
     def _next_diverse(

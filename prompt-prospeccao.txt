@@ -79,13 +79,13 @@ PYTHONUNBUFFERED=1 python scripts/hunt_generalista.py \
 
 # === MAILMAN (disparo, paralelo aos hunts) ===
 # Avalia quem NÃO recebeu e-mail nos últimos 4 dias.
-# 2 disparos por lote: 1 nicho + 1 generalista. Sem o par, espera. Pausa 2–5 min.
+# 4 disparos por lote: prefere 2 nicho + 2 generalista; completa com a outra faixa. Só espera se as duas estiverem vazias. Pausa 2–5 min.
 # Ctrl+C encerra após o lote. Lock: logs/mailman/mailman.lock
 
 # --- loop contínuo ---
 cd /home/lucas/lg-prospector && source .venv/bin/activate && \
 PYTHONUNBUFFERED=1 python scripts/mailman.py \
-  --batch-size 2 \
+  --batch-size 4 \
   --min-interval 120 \
   --max-interval 300 \
   --cooldown-days 4 \

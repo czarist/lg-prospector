@@ -2,7 +2,7 @@
 """Mailman — disparo de e-mail independente da prospecção.
 
 Avalia contatos que não receberam e-mail nos últimos 4 dias e envia
-um par por lote: 1 nicho + 1 generalista, intervalo aleatório de 2–5 min.
+um lote de 4: 2 nicho + 2 generalista, intervalo aleatório de 2–5 min.
 
 Uso:
   python scripts/mailman.py
@@ -120,13 +120,63 @@ def _echo(msg: str) -> None:
         f.write(msg.rstrip() + "\n")
 
 
+def _forecast_live(fc: dict[str, Any] | None) -> dict[str, Any]:
+    if not fc:
+        return {}
+    nicho = fc.get("niche") or {}
+    geral = fc.get("generalista") or {}
+    return {
+        "forecast": fc,
+        "nicho_sent": nicho.get("sent"),
+        "nicho_total": nicho.get("total"),
+        "nicho_ready": nicho.get("ready"),
+        "nicho_cooldown": nicho.get("cooldown"),
+        "gen_sent": geral.get("sent"),
+        "gen_total": geral.get("total"),
+        "gen_ready": geral.get("ready"),
+        "gen_waiting": geral.get("waiting"),
+        "gen_cooldown": geral.get("cooldown"),
+    }
+
+
+def _fmt_forecast(fc: dict[str, Any] | None) -> str:
+    if not fc:
+        return ""
+    n = fc.get("niche") or {}
+    g = fc.get("generalista") or {}
+    return (
+        f"nicho {int(n.get('sent') or 0)}/{int(n.get('total') or 0)} "
+        f"(prontos {int(n.get('ready') or 0)})  "
+        f"geral {int(g.get('sent') or 0)}/{int(g.get('total') or 0)} "
+        f"(prontos {int(g.get('ready') or 0)}  4d {int(g.get('waiting') or 0)})"
+    )
+
+
+async def _forecast(
+    *,
+    cooldown_days: int,
+    wait_days: int,
+) -> dict[str, Any]:
+    reset_engine()
+    await init_db()
+    factory = async_session_factory()
+    async with factory() as session:
+        data = await MailmanService(session).forecast(
+            cooldown_days=cooldown_days,
+            wait_days=wait_days,
+        )
+    await dispose_db()
+    return data
+
+
 def _print_batch(batch_n: int, result: dict[str, Any]) -> None:
     _echo(
         f"  lote {batch_n}: enviados={result.get('sent', 0)} "
         f"falhas={result.get('failed', 0)} pulados={result.get('skipped', 0)} "
         f"fila={result.get('candidates', 0)} "
         f"nicho={result.get('niche', '?')} gen={result.get('generalista', '?')} "
-        f"escolhidos={result.get('picked', 0)}"
+        f"escolhidos={result.get('picked', 0)} "
+        f"({result.get('picked_niche', '?')}+{result.get('picked_gen', '?')})"
     )
     for row in result.get("results") or []:
         mark = "✓" if row.get("outcome") in {"sent", "dry_run"} else "·"
@@ -212,7 +262,7 @@ async def main() -> None:
         "--batch-size",
         type=int,
         default=settings.mailman_batch_size,
-        help="Disparos por lote (default 2)",
+        help="Disparos por lote (default 4 = 2 nicho + 2 geral)",
     )
     p.add_argument(
         "--min-interval",
@@ -277,6 +327,9 @@ async def main() -> None:
             f"cooldown={preview['cooldown_days']}d wait={preview['wait_days']}d",
             flush=True,
         )
+        fc = preview.get("forecast") or {}
+        if fc:
+            print(f"Previsão: {_fmt_forecast(fc)}", flush=True)
         for row in preview.get("sample") or []:
             print(
                 f"  [{row['lane']:12}] {row.get('niche', ''):18} "
@@ -299,6 +352,26 @@ async def main() -> None:
         batches = int(state.get("batches") or 0)
         sent_total = int(state.get("sent_total") or 0)
         failed_total = int(state.get("failed_total") or 0)
+
+        try:
+            boot_fc = await _forecast(
+                cooldown_days=args.cooldown_days,
+                wait_days=args.wait_days,
+            )
+            _echo(f"previsão  {_fmt_forecast(boot_fc)}")
+            write_live(
+                "mailman",
+                {
+                    "status": "running",
+                    "phase": "fila",
+                    "sent_total": sent_total,
+                    "failed_total": failed_total,
+                    **_forecast_live(boot_fc),
+                },
+            )
+        except Exception as exc:
+            logger.exception("mailman_forecast_error")
+            _echo(f"  aviso previsão: {exc}")
 
         while not _stop:
             batches += 1
@@ -338,6 +411,7 @@ async def main() -> None:
                     "gen_n": result.get("generalista"),
                     "picked": result.get("picked"),
                     "last_line": last_line,
+                    **_forecast_live(result.get("forecast")),
                 },
             )
             sent_total += int(result.get("sent") or 0)
@@ -375,7 +449,7 @@ async def main() -> None:
             if empty:
                 wait = max(15.0, float(args.empty_wait))
                 _echo(
-                    f"  sem par — nicho={result.get('niche', 0)} "
+                    f"  fila vazia — nicho={result.get('niche', 0)} "
                     f"generalista={result.get('generalista', 0)} "
                     f"— aguardando {wait:.0f}s…"
                 )
@@ -391,10 +465,21 @@ async def main() -> None:
                 },
             )
             slept = 0.0
+            last_fc = 0.0
             while slept < wait and not _stop:
                 step = min(5.0, wait - slept)
                 await asyncio.sleep(step)
                 slept += step
+                if slept - last_fc >= 30 and not _stop:
+                    last_fc = slept
+                    try:
+                        fc = await _forecast(
+                            cooldown_days=args.cooldown_days,
+                            wait_days=args.wait_days,
+                        )
+                        write_live("mailman", _forecast_live(fc))
+                    except Exception:
+                        logger.exception("mailman_forecast_refresh")
 
         _echo(
             f"\n=== FIM mailman lotes={batches} enviados={sent_total} falhas={failed_total} ==="

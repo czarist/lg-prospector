@@ -86,7 +86,7 @@ A typical run looks like this:
 3. **Sync** Account + Contact + Lead into [EspoCRM](https://trentincrm.com.br).
 4. **Send** a pre-written HTML template. The model never writes or rewrites the email.
 
-Two hunt processes fill the CRM. A third process, **mailman**, is the only one that talks to SMTP. That split is intentional: prospecting can run hard while sending stays slow — **one niche + one generalist every 2–5 minutes** — so Zoho does not treat it as a blast.
+Two hunt processes fill the CRM. A third process, **mailman**, is the only one that talks to SMTP. That split is intentional: prospecting can run hard while sending stays slow — **two niche + two generalist every 2–5 minutes** — so Zoho does not treat it as a blast.
 
 ```
 hunt (niche)       ── discover → enrich → CRM ──┐
@@ -230,7 +230,7 @@ python scripts/hunt_generalista.py --focus-rs --max-tier 3 -n 8
 
 ## Mailman (send only)
 
-Looks at contacts that have **not received mail in the last 4 days**. Each batch is **one niche + one generalist**. If either side is empty, it waits. Pause between batches is random **2–5 minutes**.
+Looks at contacts that have **not received mail in the last 4 days**. Each batch prefers **two niche + two generalist** and fills leftover slots from whichever lane still has people (1+3, 0+4, …). It only waits if both lanes are empty. Pause between batches is random **2–5 minutes**.
 
 ```bash
 python scripts/mailman.py            # loop

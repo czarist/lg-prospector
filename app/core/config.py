@@ -124,7 +124,7 @@ class Settings(BaseSettings):
     email_daily_limit: int = 0
 
     # Mailman — disparo separado da prospecção (2 e-mails, pausa 2–5 min)
-    mailman_batch_size: int = 2
+    mailman_batch_size: int = 4
     mailman_interval_min_seconds: float = 120.0
     mailman_interval_max_seconds: float = 300.0
     mailman_intra_batch_min_seconds: float = 20.0
