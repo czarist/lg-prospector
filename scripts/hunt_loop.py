@@ -88,13 +88,9 @@ class HuntFileLogger:
     def __init__(self, log_dir: Path | None = None) -> None:
         self.log_dir = log_dir or _hunt_log_dir()
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        day = datetime.now().strftime("%Y%m%d")
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_id = run_id
-        self.results_jsonl = self.log_dir / f"results_{day}.jsonl"
-        self.errors_jsonl = self.log_dir / f"errors_{day}.jsonl"
-        self.results_txt = self.log_dir / f"results_{day}.log"
-        self.errors_txt = self.log_dir / f"errors_{day}.log"
+        self._day: str | None = None
         self.run_txt = self.log_dir / f"run_{run_id}.log"
         # cabeçalho da corrida
         header = (
@@ -103,10 +99,33 @@ class HuntFileLogger:
             f"{'='*72}\n"
         )
         self.run_txt.write_text(header, encoding="utf-8")
-        with self.results_txt.open("a", encoding="utf-8") as f:
-            f.write(header)
-        with self.errors_txt.open("a", encoding="utf-8") as f:
-            f.write(header)
+        self._rotate_if_needed(write_header=True)
+
+    def _rotate_if_needed(self, *, write_header: bool = False) -> None:
+        """Troca results/errors no virar do dia — o processo vive vários dias."""
+        day = datetime.now().strftime("%Y%m%d")
+        if self._day == day:
+            return
+        prev = self._day
+        self._day = day
+        self.results_jsonl = self.log_dir / f"results_{day}.jsonl"
+        self.errors_jsonl = self.log_dir / f"errors_{day}.jsonl"
+        self.results_txt = self.log_dir / f"results_{day}.log"
+        self.errors_txt = self.log_dir / f"errors_{day}.log"
+        if write_header or prev:
+            note = (
+                f"\n{'='*72}\n"
+                f"HUNT RUN {self.run_id} logs {day}"
+                + (f" (rotate {prev} → {day})" if prev else "")
+                + f" {datetime.now(timezone.utc).isoformat()}\n"
+                f"{'='*72}\n"
+            )
+            with self.results_txt.open("a", encoding="utf-8") as f:
+                f.write(note)
+            with self.errors_txt.open("a", encoding="utf-8") as f:
+                f.write(note)
+            if prev:
+                self._append_txt(self.run_txt, f"rotated results {prev} → {day}")
 
     def _append_jsonl(self, path: Path, row: dict[str, Any]) -> None:
         row = {**row, "run_id": self.run_id, "ts": datetime.now(timezone.utc).isoformat()}
@@ -122,6 +141,7 @@ class HuntFileLogger:
         self._append_txt(self.run_txt, msg)
 
     def result(self, row: dict[str, Any]) -> None:
+        self._rotate_if_needed()
         self._append_jsonl(self.results_jsonl, row)
         line = (
             f"[{row.get('ts') or datetime.now().isoformat()}] "
@@ -135,6 +155,7 @@ class HuntFileLogger:
         self._append_txt(self.run_txt, line)
 
     def error(self, row: dict[str, Any]) -> None:
+        self._rotate_if_needed()
         self._append_jsonl(self.errors_jsonl, row)
         line = (
             f"[{datetime.now().isoformat()}] "
@@ -154,6 +175,7 @@ class HuntFileLogger:
             "stage": stage,
             "result": result,
         }
+        self._rotate_if_needed()
         self._append_jsonl(self.results_jsonl, row)
         line = f"  stage={stage} → {json.dumps(result, ensure_ascii=False, default=str)[:400]}"
         self._append_txt(self.results_txt, line)
