@@ -76,6 +76,7 @@ async def search_companies_node(state: CampaignGraphState) -> dict[str, Any]:
         max_results=int(state.get("max_results") or 20),
     )
     results = await provider.search_companies(ctx)
+    results = [r for r in results if r.is_valid_company()]
     companies = [r.model_dump() for r in results]
     return {
         "companies": companies,

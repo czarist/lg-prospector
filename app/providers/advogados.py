@@ -63,9 +63,12 @@ class AdvogadosProvider(SearchProviderMixin, BaseProvider):
         )
 
     def _organic_queries(self, q: str, ctx: SearchContext) -> list[str]:
+        from app.domain.cities import is_nationwide, search_location
+
         city = (ctx.city or "").strip()
         state = (ctx.state or "").strip()
-        loc = " ".join(x for x in (city, state) if x)
+        loc = search_location(city, state)
+        municipal = bool(city) and not is_nationwide(city, state)
         base = (q or "escritório de advocacia").strip()
         neg = self._neg()
         variants = [
@@ -74,8 +77,8 @@ class AdvogadosProvider(SearchProviderMixin, BaseProvider):
             f"advogados associados {loc} site contato {neg}".strip(),
             f"escritório advocacia empresarial {loc} email {neg}".strip(),
             # TLD típico de escritório BR
-            f'site:.adv.br "{city}" advocacia contato {neg}'.strip() if city else f"site:.adv.br advocacia {loc} {neg}".strip(),
-            f'"{city}" "sociedade de advogados" (email OR "@") {neg}'.strip() if city else "",
+            f'site:.adv.br "{city}" advocacia contato {neg}'.strip() if municipal else f"site:.adv.br advocacia {loc} {neg}".strip(),
+            f'"{city}" "sociedade de advogados" (email OR "@") {neg}'.strip() if municipal else "",
             f"advogado trabalhista {loc} escritório email site {neg}".strip(),
             f"advogado cível {loc} escritório contato {neg}".strip(),
             f"advocacia {loc} \"@\" contato -gov {neg}".strip(),
@@ -119,7 +122,7 @@ class AdvogadosProvider(SearchProviderMixin, BaseProvider):
 
         def _add(pr: ProviderResult) -> None:
             pr.segment = self.segment
-            if not pr.is_valid_company():
+            if not pr.is_valid_company() or self._is_known_lead(pr, ctx):
                 return
             key = pr.normalize_key()
             if key in seen:
@@ -182,7 +185,7 @@ class AdvogadosProvider(SearchProviderMixin, BaseProvider):
                 break
             need = target - len(pool) + 4
             more = await self._search_organic(
-                search_q, need, city=ctx.city, state=ctx.state
+                search_q, need, city=ctx.city, state=ctx.state, ctx=ctx
             )
             for r in more:
                 r.segment = self.segment
@@ -315,7 +318,8 @@ class AdvogadosProvider(SearchProviderMixin, BaseProvider):
             em = normalize_email(resolved.email)
             if not has_valid_email(em) or is_public_email(em):
                 continue
-            if em in seen_email:
+            _, _, exclude_emails = self._known_sets(ctx)
+            if em in seen_email or em in exclude_emails:
                 continue
             seen_email.add(em)
             resolved.email = em

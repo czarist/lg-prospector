@@ -5,7 +5,8 @@ Cada ciclo descobre empresas na cidade da vez, analisa e cadastra no CRM.
 O disparo de e-mail ficou no mailman (`scripts/mailman.py`).
 
 Uso:
-  python scripts/hunt_generalista.py --focus-rs --max-tier 3 -n 8
+  python scripts/hunt_generalista.py -n 8
+  python scripts/hunt_generalista.py --no-nationwide --max-tier 3 -n 8
   python scripts/hunt_generalista.py --city "Porto Alegre" --state RS --once
   python scripts/hunt_generalista.py --with-send --once   # legado: também dispara
 """
@@ -27,7 +28,8 @@ sys.path.insert(0, str(ROOT))
 from app.core.live import write_live
 from app.core.logging import get_logger, setup_logging
 from app.core.paths import logs_dir
-from app.domain.cities import CityTarget, build_city_queue
+from app.domain.cities import CityTarget, resolve_hunt_cities
+from app.providers.http_tools import serper_block_info
 from app.infrastructure.database.session import (
     async_session_factory,
     dispose_db,
@@ -130,18 +132,38 @@ def _print_metrics(result: dict[str, Any]) -> None:
         f"      pesquisadas={e3.get('pesquisadas', 0)} "
         f"enriquecidas={e3.get('enriquecidas', 0)} "
         f"cadastradas={e3.get('cadastradas_crm', 0)} "
-        f"descartadas={e3.get('descartadas', 0)}",
+        f"descartadas={e3.get('descartadas', 0)} "
+        f"tentativas={e3.get('discover_attempts', 1)}",
         flush=True,
     )
+    blocked = serper_block_info()
+    if blocked.get("blocked"):
+        print(
+            "  ⚠ Serper sem crédito — busca grátis (DDG/OSM) até recarregar",
+            flush=True,
+        )
 
 
 async def main() -> None:
     p = argparse.ArgumentParser(description="Rotina generalista (independente dos nichos)")
-    p.add_argument("--focus-rs", action="store_true", help="Prioriza RS na fila de cidades")
+    p.add_argument(
+        "--nationwide",
+        dest="nationwide",
+        action="store_true",
+        help="Busca em todo o Brasil (default)",
+    )
+    p.add_argument(
+        "--no-nationwide",
+        dest="nationwide",
+        action="store_false",
+        help="Usa escada de cidades em vez de uma busca nacional",
+    )
+    p.add_argument("--focus-rs", action="store_true", help="Escada de cidades com RS primeiro")
     p.add_argument("--only-rs", action="store_true", help="Só cidades do RS")
     p.add_argument("--max-tier", type=int, default=3)
     p.add_argument("--min-pop-k", type=int, default=50)
-    p.add_argument("-n", "--max", type=int, default=8, help="Novos leads por cidade")
+    p.set_defaults(nationwide=True)
+    p.add_argument("-n", "--max", type=int, default=8, help="Novos leads por alvo")
     p.add_argument(
         "--with-send",
         action="store_true",
@@ -172,15 +194,15 @@ async def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    if args.city:
-        cities = [CityTarget(args.city, args.state or "RS", 1, 0, "sul")]
-    else:
-        cities = build_city_queue(
-            focus_rs=args.focus_rs,
-            only_rs=args.only_rs,
-            max_tier=args.max_tier,
-            min_population_k=args.min_pop_k,
-        )
+    cities = resolve_hunt_cities(
+        nationwide=args.nationwide,
+        focus_rs=args.focus_rs,
+        only_rs=args.only_rs,
+        max_tier=args.max_tier,
+        min_population_k=args.min_pop_k,
+        city=args.city,
+        state=args.state,
+    )
     if not cities:
         print("Fila de cidades vazia.", flush=True)
         raise SystemExit(1)
@@ -193,10 +215,11 @@ async def main() -> None:
 
     settings = get_settings()
     print(
-        f"Generalista: {len(cities)} cidades  idx={idx}  "
+        f"Generalista: {len(cities)} alvo(s)  idx={idx}  "
         f"wait={args.wait_days}d  dry_run={args.dry_run}  "
         f"send={'on' if args.with_send else 'mailman'}  "
-        f"backend={settings.search_backend} serper={'yes' if settings.serper_api_key else 'no'}",
+        f"backend={settings.search_backend} serper={'yes' if settings.serper_api_key else 'no'}  "
+        f"(sempre descobre lead NOVO; Serper sem crédito → DDG/OSM)",
         flush=True,
     )
 

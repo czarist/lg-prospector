@@ -17,6 +17,28 @@ class SearchProviderMixin:
     segment: str = ""
     source_label: str = "search"
 
+    @staticmethod
+    def _known_sets(ctx: SearchContext) -> tuple[set[str], set[str], set[str]]:
+        extra = ctx.extra or {}
+        hosts = {str(h).strip().lower() for h in (extra.get("exclude_hosts") or []) if h}
+        names = {str(n).strip().lower() for n in (extra.get("exclude_names") or []) if n}
+        emails = {str(e).strip().lower() for e in (extra.get("exclude_emails") or []) if e}
+        return hosts, names, emails
+
+    def _is_known_lead(self, pr: ProviderResult, ctx: SearchContext) -> bool:
+        """Empresa/e-mail já no CRM — não reciclar no mesmo ciclo."""
+        from app.providers.domain_email import extract_registrable_domain
+
+        hosts, names, emails = self._known_sets(ctx)
+        host = extract_registrable_domain(pr.website or "")
+        if host and host.lower() in hosts:
+            return True
+        name = (pr.company_name or "").strip().lower()
+        if name and name in names:
+            return True
+        em = (pr.email or "").strip().lower()
+        return bool(em and em in emails)
+
     async def _search_organic(
         self,
         query: str,
@@ -25,6 +47,7 @@ class SearchProviderMixin:
         city: str = "",
         state: str = "",
         search_type: str = "search",
+        ctx: SearchContext | None = None,
     ) -> list[ProviderResult]:
         results: list[ProviderResult] = []
         organic = await serper_search(
@@ -45,19 +68,22 @@ class SearchProviderMixin:
             if not email:
                 emails = extract_emails(snippet)
                 email = emails[0] if emails else ""
-            results.append(
-                ProviderResult(
-                    company_name=self._clean_title(title),
-                    website=link,
-                    phone=phone,
-                    email=email,
-                    city=parsed_city or city,
-                    state=parsed_state or state,
-                    segment=self.segment,
-                    source=item.get("source") or self.source_label,
-                    extra={"snippet": snippet, "raw": item},
-                )
+            pr = ProviderResult(
+                company_name=self._clean_title(title),
+                website=link,
+                phone=phone,
+                email=email,
+                city=parsed_city or city,
+                state=parsed_state or state,
+                segment=self.segment,
+                source=item.get("source") or self.source_label,
+                extra={"snippet": snippet, "raw": item},
             )
+            if ctx is not None and self._is_known_lead(pr, ctx):
+                continue
+            if not pr.is_valid_company():
+                continue
+            results.append(pr)
         return results
 
     async def _enrich_from_website(self, company: ProviderResult) -> ProviderResult:
@@ -68,6 +94,9 @@ class SearchProviderMixin:
 
     @staticmethod
     def _clean_title(title: str) -> str:
+        low = (title or "").lower()
+        if "wikipedia" in low or "wikipédia" in low:
+            return ""
         for sep in [" - ", " | ", " – "]:
             if sep in title:
                 title = title.split(sep)[0]

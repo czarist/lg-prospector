@@ -29,6 +29,11 @@ def write_live(name: str, update: dict[str, Any]) -> None:
         except Exception:
             prev = {}
     prev.update(update)
+    if "last_error" not in update and str(update.get("phase") or "") not in {
+        "erro",
+        "error",
+    }:
+        prev.pop("last_error", None)
     prev["ts"] = datetime.now(timezone.utc).isoformat()
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(prev, ensure_ascii=False, default=str), encoding="utf-8")

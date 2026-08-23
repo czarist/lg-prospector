@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -45,7 +45,9 @@ from app.infrastructure.email.smtp import (
 from app.providers.geo_email import (
     classify_contact_email,
     email_needs_llm_review,
+    is_junk_lead_name,
     is_plausible_lead,
+    looks_like_campaign_name,
 )
 from app.providers.generalista import ORIGIN
 from app.providers.opportunity import OpportunityReport, analyze_opportunity
@@ -56,7 +58,75 @@ from app.services.stage_service import StageService
 logger = get_logger(__name__)
 
 NICHE = "generalista"
-_EXCLUDED_SEGMENTS = {"politico", "partido"}
+_EXCLUDED_SEGMENTS: frozenset[str] = frozenset()
+_DURABLE_SKIP_PREFIXES = (
+    "llm_email",
+    "orgao_publico",
+    "email_implausivel",
+    "email:",
+    "fora_do_nicho",
+    "opt_out",
+    "negociacao_ativa",
+    "bounce",
+    "campanha_politica",
+    "nome_lixo",
+    "empresa_estrangeira",
+)
+
+
+def is_durable_mail_skip(reason: str | None) -> bool:
+    why = (reason or "").strip()
+    return any(why == p or why.startswith(p) for p in _DURABLE_SKIP_PREFIXES)
+
+
+def contact_mail_skip_reason(extra: dict[str, Any] | None) -> str | None:
+    extra = extra or {}
+    stored = extra.get("mailman_skip")
+    if stored:
+        why = str(stored)
+        # político deixou de ser excluído do template geral
+        if why == "segmento_excluido":
+            return None
+        return why
+    verdict = extra.get("llm_email")
+    if isinstance(verdict, dict) and verdict.get("keep") is False:
+        return f"llm_email:{verdict.get('reason') or 'drop'}"
+    return None
+
+
+def mark_contact_mail_skip(contact: Contact, reason: str) -> bool:
+    """Grava recusa permanente no contato. True se escreveu agora."""
+    if not is_durable_mail_skip(reason):
+        return False
+    extra = dict(contact.extra or {})
+    if extra.get("mailman_skip"):
+        return False
+    extra["mailman_skip"] = reason
+    extra["mailman_skip_at"] = datetime.now(timezone.utc).isoformat()
+    contact.extra = extra
+    return True
+
+
+def _not_permanently_skipped_clause():
+    """Fora da janela SQL: skip gravado ou LLM já recusou (keep=false)."""
+    skip = func.json_unquote(func.json_extract(Contact.extra, "$.mailman_skip"))
+    keep = func.json_unquote(func.json_extract(Contact.extra, "$.llm_email.keep"))
+    return and_(
+        or_(
+            Contact.extra.is_(None),
+            skip.is_(None),
+            skip == "",
+            skip == "null",
+            skip == "segmento_excluido",
+        ),
+        or_(
+            Contact.extra.is_(None),
+            keep.is_(None),
+            keep == "",
+            keep == "null",
+            keep == "true",
+        ),
+    )
 
 
 class GeneralistService:
@@ -337,10 +407,56 @@ class GeneralistService:
             },
             run_async=False,
         )
-        discover = await self.stage_svc.run_stage(camp.id, "discover")
+        # sempre tenta achar lead NOVO: se a 1ª query só devolver
+        # empresa já no CRM (ou SERP vazio), gira o setor e tenta de novo
+        max_discover_rounds = 4
+        found_total = 0
+        discover: dict[str, Any] = {}
+        attempts = 0
+        camp_id = camp.id
+        for attempt in range(max_discover_rounds):
+            attempts = attempt + 1
+            if attempt > 0:
+                refreshed = await self.stage_svc.get_campaign(camp_id)
+                if refreshed:
+                    next_q = pick_query(NICHE, city, query_round + attempt)
+                    refreshed.query = next_q
+                    q = next_q
+                    await self.session.flush()
+            discover = await self.stage_svc.run_stage(camp_id, "discover")
+            n = int(discover.get("companies_found") or 0)
+            queued = int(discover.get("queued") or 0)
+            found_total += n + queued
+            if n > 0 or queued > 0:
+                break
+            logger.info(
+                "generalista_discover_retry",
+                city=city,
+                state=state,
+                attempt=attempts,
+                query=q,
+            )
+        discover["companies_found"] = found_total
+        discover["discover_attempts"] = attempts
         enrich = await self.stage_svc.run_stage(camp.id, "enrich")
+        drain_en = await self.stage_svc.enrich_ready(
+            niche=NICHE, limit=max_new, exclude_campaign_id=camp.id
+        )
+        enrich = {
+            **enrich,
+            "enriched": int(enrich.get("enriched") or 0) + int(drain_en.get("enriched") or 0),
+            "discarded": int(enrich.get("discarded") or 0) + int(drain_en.get("discarded") or 0),
+        }
         analyzed = await self._analyze_enriched(camp.id)
         crm = await self.stage_svc.run_stage(camp.id, "crm")
+        drain_crm = await self.stage_svc.crm_ready(
+            niche=NICHE, limit=max_new, exclude_campaign_id=camp.id
+        )
+        crm = {
+            **crm,
+            "synced": int(crm.get("synced") or 0) + int(drain_crm.get("synced") or 0),
+            "failed": int(crm.get("failed") or 0) + int(drain_crm.get("failed") or 0),
+        }
 
         camp = await self.stage_svc.get_campaign(camp.id)
         if camp:
@@ -351,11 +467,13 @@ class GeneralistService:
             "campaign_id": camp.id if camp else None,
             "query": q,
             "pesquisadas": discover.get("companies_found", 0),
+            "enfileiradas": discover.get("queued", 0),
             "enriquecidas": enrich.get("enriched", 0),
             "descartadas": enrich.get("discarded", 0),
             "analisadas": analyzed,
             "cadastradas_crm": crm.get("synced", 0),
             "crm_falhas": crm.get("failed", 0),
+            "discover_attempts": discover.get("discover_attempts", 1),
             "nota": "novos leads NÃO recebem e-mail agora (espera 4 dias)",
         }
 
@@ -517,13 +635,24 @@ class GeneralistService:
             return False, "sem_email"
         extra_c = contact.extra or {}
         extra_co = (company.extra if company else None) or {}
+        cached = contact_mail_skip_reason(extra_c)
+        if cached:
+            return False, cached
         if extra_c.get("opt_out") or extra_co.get("opt_out"):
+            mark_contact_mail_skip(contact, "opt_out")
             return False, "opt_out"
+        cname = (company.name if company else "") or contact.name or ""
+        if looks_like_campaign_name(cname, extra_co) or (
+            (company.segment if company else "") or ""
+        ).lower() in {"politico", "partido"}:
+            mark_contact_mail_skip(contact, "campanha_politica")
+            return False, "campanha_politica"
+        if is_junk_lead_name(cname):
+            mark_contact_mail_skip(contact, "nome_lixo")
+            return False, "nome_lixo"
         if extra_c.get("negociacao_ativa") or extra_co.get("negociacao_ativa"):
+            mark_contact_mail_skip(contact, "negociacao_ativa")
             return False, "negociacao_ativa"
-        seg = ((company.segment if company else "") or "").lower()
-        if seg in _EXCLUDED_SEGMENTS:
-            return False, "segmento_excluido"
         origin = (company.source if company else "") or extra_co.get("origin") or ""
         if only_origin and origin != only_origin:
             return False, "origem_outra"
@@ -542,6 +671,7 @@ class GeneralistService:
             segment=NICHE,
             allow_gov_br=True,
         ):
+            mark_contact_mail_skip(contact, "orgao_publico")
             return False, "orgao_publico"
         if company and not is_plausible_lead(
             name=company.name or "",
@@ -550,6 +680,7 @@ class GeneralistService:
             snippet=str(extra_co.get("snippet") or ""),
             segment=NICHE,
         ):
+            mark_contact_mail_skip(contact, "fora_do_nicho_ou_nacionalidade")
             return False, "fora_do_nicho_ou_nacionalidade"
         ok, reason = classify_contact_email(
             email,
@@ -559,8 +690,11 @@ class GeneralistService:
             segment=NICHE,
         )
         if not ok:
-            return False, f"email:{reason}"
+            why = f"email:{reason}"
+            mark_contact_mail_skip(contact, why)
+            return False, why
         if await self.stage_svc._email_was_bounced(email, contact_id=contact.id):
+            mark_contact_mail_skip(contact, "bounce")
             return False, "bounce"
         if await self._already_sent_generalist(email, contact.id):
             return False, "ja_enviado_este_template"
@@ -579,7 +713,9 @@ class GeneralistService:
             extra_c["llm_email"] = verdict
             contact.extra = extra_c
             if not verdict.get("keep", True):
-                return False, f"llm_email:{verdict.get('reason') or 'drop'}"
+                why = f"llm_email:{verdict.get('reason') or 'drop'}"
+                mark_contact_mail_skip(contact, why)
+                return False, why
         return True, "ok"
 
     async def _already_sent_generalist(self, email: str, contact_id: str | None) -> bool:
@@ -598,12 +734,48 @@ class GeneralistService:
         n = int((await self.session.execute(q)).scalar() or 0)
         return n > 0
 
-    async def _eligible_existing_contacts(self, *, limit: int) -> list[Contact]:
+    def _recent_any_email_exists(self, cooldown_days: int):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(0, int(cooldown_days)))
+        return exists(
+            select(EmailRecord.id).where(
+                EmailRecord.status.in_(["sent", "dry_run"]),
+                EmailRecord.sent_at.is_not(None),
+                EmailRecord.sent_at >= cutoff,
+                or_(
+                    EmailRecord.contact_id == Contact.id,
+                    func.lower(EmailRecord.to_address) == func.lower(Contact.email),
+                ),
+            )
+        )
+
+    def _bounced_email_exists(self):
+        return exists(
+            select(EmailRecord.id).where(
+                EmailRecord.status == "bounced",
+                or_(
+                    EmailRecord.contact_id == Contact.id,
+                    func.lower(EmailRecord.to_address) == func.lower(Contact.email),
+                ),
+            )
+        )
+
+    async def _eligible_existing_contacts(
+        self,
+        *,
+        limit: int,
+        offset: int = 0,
+        cooldown_days: int | None = None,
+    ) -> list[Contact]:
         """Contatos já no CRM que NÃO são leads generalistas novos.
 
-        Exclui quem já recebeu este template — senão a janela dos 45 mais
-        antigos trava e nunca chega no restante da base.
+        Fora da janela: já receberam o template geral, estão em cooldown
+        global, bounce, ou recusa permanente (LLM / mailman_skip). Sem
+        isso os 240 mais antigos entopem e o restante da base nunca sai.
         """
+        settings = get_settings()
+        cooldown = int(
+            cooldown_days if cooldown_days is not None else settings.email_cooldown_days
+        )
         already = exists(
             select(EmailRecord.id).where(
                 EmailRecord.template_name == TEMPLATE_FILE,
@@ -624,10 +796,9 @@ class GeneralistService:
                 Contact.crm_id.is_not(None),
                 Contact.crm_id != "",
                 ~already,
-                or_(
-                    Company.segment.is_(None),
-                    Company.segment.notin_(list(_EXCLUDED_SEGMENTS)),
-                ),
+                ~self._recent_any_email_exists(cooldown),
+                ~self._bounced_email_exists(),
+                _not_permanently_skipped_clause(),
                 or_(
                     Company.source.is_(None),
                     Company.source != ORIGIN,
@@ -635,6 +806,7 @@ class GeneralistService:
                 ),
             )
             .order_by(Contact.created_at.asc())
+            .offset(max(0, int(offset)))
             .limit(limit)
         )
         return list((await self.session.execute(q)).scalars().unique().all())
@@ -648,6 +820,7 @@ class GeneralistService:
             .options(
                 selectinload(CampaignItem.company),
                 selectinload(CampaignItem.contact),
+                selectinload(CampaignItem.campaign),
             )
             .where(
                 CampaignItem.stage == ItemStageStatus.CRM_SYNCED.value,

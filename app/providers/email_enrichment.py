@@ -25,10 +25,20 @@ from app.providers.domain_email import (
     matches_company_domain,
     pick_best_email,
 )
-from app.providers.geo_email import classify_contact_email, email_needs_llm_review
+from app.providers.geo_email import (
+    classify_contact_email,
+    email_needs_llm_review,
+    html_says_foreign,
+    inspect_html_nationality,
+    is_br_domain,
+    is_foreign_company,
+    is_plausible_lead,
+    verdict_from_html_signals,
+)
 from app.providers.scraper import (
     EMAIL_RE,
     extract_emails,
+    fetch_httpx,
     normalize_url,
     scrape_website,
 )
@@ -84,6 +94,90 @@ def email_fits_contact(email: str, contact: ProviderResult) -> tuple[bool, str]:
         website=contact.website or "",
         segment=contact.segment or "",
     )
+
+
+def _nationality_reject_reason(contact: ProviderResult) -> str | None:
+    """Barra veículo/empresa estrangeira (Fox News, CNN.com, TV dos EUA…)."""
+    name = contact.company_name or contact.contact_name or ""
+    website = contact.website or ""
+    email = contact.email or ""
+    snippet = str((contact.extra or {}).get("snippet") or "")
+    if is_foreign_company(name=name, website=website, email=email, snippet=snippet):
+        return "empresa_estrangeira"
+    if not is_plausible_lead(
+        name=name,
+        website=website,
+        email=email,
+        snippet=snippet,
+        segment=contact.segment or "",
+    ):
+        return "fora_do_nicho_ou_nacionalidade"
+    extra = contact.extra or {}
+    scrape = extra.get("scrape") or {}
+    br = list(scrape.get("br_signals") or [])
+    fo = list(scrape.get("foreign_signals") or [])
+    sample = str(extra.get("raw_text_sample") or "")
+    if not br and not fo and sample:
+        br, fo = inspect_html_nationality(sample)
+    if verdict_from_html_signals(br, fo) == "foreign":
+        return "html_estrangeiro"
+    return None
+
+
+async def _confirm_site_is_brazilian(contact: ProviderResult) -> str | None:
+    """Se o domínio não é .br e o scrape não trouxe sinal BR, olha o HTML da home."""
+    why = _nationality_reject_reason(contact)
+    if why:
+        return why
+    website = normalize_url(contact.website or "")
+    if not website:
+        return None
+    host = company_domain_of(contact)
+    extra = contact.extra or {}
+    scrape = extra.get("scrape") or {}
+    if verdict_from_html_signals(
+        list(scrape.get("br_signals") or []),
+        list(scrape.get("foreign_signals") or []),
+    ) == "br":
+        return None
+    if is_br_domain(host):
+        return None
+    if verdict_from_html_signals(
+        list(scrape.get("br_signals") or []),
+        list(scrape.get("foreign_signals") or []),
+    ) == "foreign":
+        return "html_estrangeiro"
+    html = await fetch_httpx(website, timeout=12.0)
+    if not html:
+        return None
+    if html_says_foreign(html):
+        br, fo = inspect_html_nationality(html)
+        _merge_extra(
+            contact,
+            {
+                "scrape": {
+                    **(scrape if isinstance(scrape, dict) else {}),
+                    "br_signals": br[:8],
+                    "foreign_signals": fo[:8],
+                    "pass": "nationality_home",
+                }
+            },
+        )
+        return "html_estrangeiro"
+    br, fo = inspect_html_nationality(html)
+    if br or fo:
+        _merge_extra(
+            contact,
+            {
+                "scrape": {
+                    **(scrape if isinstance(scrape, dict) else {}),
+                    "br_signals": br[:8],
+                    "foreign_signals": fo[:8],
+                    "pass": "nationality_home",
+                }
+            },
+        )
+    return None
 
 
 async def find_email_multi_pass(
@@ -260,6 +354,15 @@ async def require_email(
     domain = company_domain_of(contact)
     if allow_free_mail is None:
         allow_free_mail = not domain
+    why = _nationality_reject_reason(contact)
+    if why:
+        logger.info(
+            "lead_discarded_foreign",
+            company=contact.company_name,
+            website=contact.website or None,
+            reason=why,
+        )
+        return None
     # se já tem e-mail e free-mail liberado, não força domínio
     req_dom = require_domain and bool(domain) and not allow_free_mail
     result = await find_email_multi_pass(
@@ -274,6 +377,17 @@ async def require_email(
             company=result.company_name,
             website=result.website or None,
             domain=domain or None,
+        )
+        return None
+
+    why = await _confirm_site_is_brazilian(result)
+    if why:
+        logger.info(
+            "lead_discarded_foreign",
+            company=result.company_name,
+            website=result.website or None,
+            email=result.email,
+            reason=why,
         )
         return None
 
@@ -343,7 +457,8 @@ async def require_email(
             )
             return None
 
-    if email_needs_llm_review(result.email):
+    # Qwen fica no reviewer (processo à parte). Enrich não compete pela GPU.
+    if email_needs_llm_review(result.email) and not get_settings().review_queue_enabled:
         from app.infrastructure.llm.client import score_email_belongs_to_business
 
         snippet = str((result.extra or {}).get("snippet") or "")
@@ -376,7 +491,11 @@ def _merge_scrape_extra(contact: ProviderResult, scrape, pass_name: str) -> None
         "method": scrape.method,
         "pages": scrape.pages_visited,
         "emails_found": scrape.emails[:8],
+        "br_signals": list(getattr(scrape, "br_signals", []) or [])[:8],
+        "foreign_signals": list(getattr(scrape, "foreign_signals", []) or [])[:8],
     }
+    if scrape.raw_text_sample:
+        extra["raw_text_sample"] = scrape.raw_text_sample[:1200]
     contact.extra = extra
 
 

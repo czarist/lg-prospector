@@ -59,7 +59,9 @@ class PoliticosProvider(SearchProviderMixin, BaseProvider):
     source_label = "partidos_campanha"
 
     def _location(self, ctx: SearchContext) -> str:
-        return " ".join(x for x in ((ctx.city or "").strip(), (ctx.state or "").strip()) if x)
+        from app.domain.cities import search_location
+
+        return search_location(ctx.city, ctx.state)
 
     def _neg(self) -> str:
         return (
@@ -70,38 +72,52 @@ class PoliticosProvider(SearchProviderMixin, BaseProvider):
         )
 
     def _build_queries(self, ctx: SearchContext) -> list[str]:
+        from app.domain.cities import is_nationwide
+
         q = (ctx.query or "").strip()
         loc = self._location(ctx)
         city = (ctx.city or "").strip()
         state = (ctx.state or "").strip()
+        municipal = bool(city) and not is_nationwide(city, state)
+        uf = bool(state) and not is_nationwide(city, state)
         neg = self._neg()
 
         queries: list[str] = []
         if q:
             queries.append(f"{q} {loc} partido diretório contato email {neg}".strip())
             queries.append(f"{q} {loc} campanha site contato email {neg}".strip())
-        if city:
+        if municipal:
             queries.append(f"diretório municipal partido {city} {state} contato email {neg}".strip())
             queries.append(f"comissão provisória partido {city} contato email {neg}".strip())
             queries.append(f"candidato prefeito {city} campanha email contato {neg}".strip())
-        if state:
+        if uf:
             queries.append(f"diretório estadual partido {state} contato email {neg}".strip())
+        else:
+            queries.append(f"diretório estadual partido contato email {neg}".strip())
+            queries.append(f"diretório nacional partido contato email {neg}".strip())
 
-        if city or state:
+        if municipal or uf:
             seed = sum(ord(c) for c in (city or state))
             n = len(PARTIDOS_BR)
             start = seed % max(1, n)
             picked = [PARTIDOS_BR[(start + i * 3) % n] for i in range(min(3, n))]
             for p in picked:
                 sigla = p["sigla"]
-                if city:
+                if municipal:
                     queries.append(
                         f'diretório {sigla} {city} (contato OR email OR "comissão provisória") {neg}'
                     )
                 else:
                     queries.append(f"diretório estadual {sigla} {state} contato email {neg}")
+        else:
+            seed = sum(ord(c) for c in loc)
+            n = len(PARTIDOS_BR)
+            start = seed % max(1, n)
+            picked = [PARTIDOS_BR[(start + i * 3) % n] for i in range(min(3, n))]
+            for p in picked:
+                queries.append(f"diretório {p['sigla']} Brasil contato email {neg}")
 
-        queries.append(f"equipe de campanha {loc} email contato {neg}".strip())
+        # "equipe de campanha" puxa Wikipedia/listicle; cai fora de propósito
 
         seen: set[str] = set()
         out: list[str] = []
@@ -224,7 +240,9 @@ class PoliticosProvider(SearchProviderMixin, BaseProvider):
         return "", ""
 
     async def _from_tse(self, ctx: SearchContext) -> list[ProviderResult]:
-        if not ctx.city or not ctx.state:
+        from app.domain.cities import is_nationwide
+
+        if not ctx.city or not ctx.state or is_nationwide(ctx.city, ctx.state):
             return []
         # pede mais candidatos do que o alvo: a maioria não terá e-mail público
         pool = max(ctx.max_results * 4, 20)
@@ -349,21 +367,16 @@ class PoliticosProvider(SearchProviderMixin, BaseProvider):
                     source=source,
                     extra={"snippet": snippet, "query": query[:120]},
                 )
-                # se já tem e-mail → ok; se não, só com website e válido
-                if email:
-                    if not has_valid_email(email) or is_public_email(email):
-                        continue
-                elif not pr.is_valid_company():
+                if email and (not has_valid_email(email) or is_public_email(email)):
                     continue
-                else:
-                    # sem e-mail: só passa se is_politico_target ok (já checado)
-                    pass
-                if not pr.is_valid_company() and not email:
+                if not pr.is_valid_company():
                     continue
                 # forçar validação político
                 if not is_politico_target(
                     name=pr.company_name, website=pr.website, email=pr.email, snippet=snippet
                 ):
+                    continue
+                if self._is_known_lead(pr, ctx):
                     continue
                 results.append(pr)
                 if len(results) >= need:
@@ -378,7 +391,9 @@ class PoliticosProvider(SearchProviderMixin, BaseProvider):
         tse = await self._from_tse(ctx)
         for pr in tse:
             key = pr.normalize_key() + "|" + (pr.email or "")
-            if key in seen:
+            if key in seen or self._is_known_lead(pr, ctx):
+                continue
+            if not pr.is_valid_company():
                 continue
             seen.add(key)
             results.append(pr)
@@ -392,6 +407,8 @@ class PoliticosProvider(SearchProviderMixin, BaseProvider):
                     continue
                 # web sem e-mail: ok se site; enrich exige e-mail depois
                 if pr.email and is_public_email(pr.email):
+                    continue
+                if not pr.is_valid_company():
                     continue
                 seen.add(key)
                 results.append(pr)

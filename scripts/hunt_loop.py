@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Loop contínuo de prospecção: 5 leads × nicho × cidade (escada comercial).
+"""Loop contínuo de prospecção: 5 leads × nicho (Brasil inteiro por padrão).
 
 Só prospecta (discover → enrich → crm). O disparo de e-mail é o mailman:
   python scripts/mailman.py
 
-
-Ordem de cidades (escadinha):
-  1. Capitais (Porto Alegre / RS primeiro se --focus-rs)
-  2. Polos gaúchos (Caxias, Canoas, Pelotas, …)
-  3. Outras cidades de alto pop/PIB
-  4. Tier 3 só com --max-tier 3
-
-Não gasta rodada em município pequeno (min pop default 90k, exceto capitais).
+Padrão: uma busca nacional (Brasil) por nicho. Escada de cidades:
+  python scripts/hunt_loop.py --no-nationwide
+  1. Capitais (por população; Porto Alegre primeiro só com --focus-rs)
+  2. Polos nacionais + gaúchos
+  3. Tier 3 só com --max-tier 3
 
 Estado persistido em logs/hunt_loop_state.json (retoma após restart).
 
 Exemplos:
-  # foco RS + capitais, 5 por nicho, sem fim
-  python scripts/hunt_loop.py --focus-rs --max-tier 2 -n 5
+  # todo o país (default), 5 por nicho
+  python scripts/hunt_loop.py -n 5
 
-  # só RS (sem SP/RJ…), uma volta e para
+  # escada nacional de cidades
+  python scripts/hunt_loop.py --no-nationwide --max-tier 2 -n 5
+
+  # só RS, uma volta e para
   python scripts/hunt_loop.py --only-rs --once
 
   # dry-run: só imprime a fila
@@ -53,11 +53,12 @@ from app.core.paths import logs_dir
 from app.domain.cities import (
     DEFAULT_NICHES,
     CityTarget,
-    build_city_queue,
     pick_query,
+    resolve_hunt_cities,
 )
 from app.domain.stages import ItemStageStatus
 from app.infrastructure.database.session import async_session_factory, init_db, reset_engine
+from app.providers.http_tools import serper_block_info
 from app.services.campaign_service import CampaignService
 from app.services.stage_service import StageService
 
@@ -242,6 +243,58 @@ def _build_jobs(
     return jobs
 
 
+async def _discover_new_leads(
+    stage_svc: StageService,
+    *,
+    campaign_id: str,
+    niche: str,
+    city: CityTarget,
+    query_round: int,
+    echo,
+) -> dict[str, Any]:
+    """Descoberta com retry: se a query só devolver lead já no CRM, gira e tenta de novo."""
+    max_rounds = 4
+    created_total = 0
+    queued_total = 0
+    last: dict[str, Any] = {}
+    last_query = ""
+    attempts = 0
+    for attempt in range(max_rounds):
+        attempts = attempt + 1
+        if attempt > 0:
+            camp = await stage_svc.get_campaign(campaign_id)
+            if camp:
+                next_q = pick_query(niche, city.city, query_round + attempt)
+                camp.query = next_q
+                last_query = next_q
+                await stage_svc.session.flush()
+                echo(f"  … discover retry {attempts}/{max_rounds} query={next_q!r}")
+        last = await stage_svc.run_stage(campaign_id, "discover")
+        n = int(last.get("companies_found") or 0)
+        queued = int(last.get("queued") or 0)
+        created_total += n
+        queued_total += queued
+        last_query = str(last.get("query_used") or last_query)
+        if n > 0 or queued > 0:
+            break
+        logger.info(
+            "nicho_discover_retry",
+            niche=niche,
+            city=city.city,
+            state=city.state,
+            attempt=attempts,
+            query=last_query,
+        )
+    last["companies_found"] = created_total
+    last["queued"] = queued_total
+    last["discover_attempts"] = attempts
+    blocked = serper_block_info()
+    if blocked.get("blocked"):
+        echo("  ⚠ Serper sem crédito — busca grátis (DDG/OSM) até recarregar")
+        last["search_fallback"] = "free"
+    return last
+
+
 async def _run_one(
     *,
     niche: str,
@@ -318,6 +371,15 @@ async def _run_one(
                             "Parando o hunt para não marcar lead como failed."
                         )
                         _stop = True
+                elif st == "discover":
+                    result = await _discover_new_leads(
+                        stage_svc,
+                        campaign_id=cid,
+                        niche=niche,
+                        city=city,
+                        query_round=query_round,
+                        echo=_echo,
+                    )
                 else:
                     result = await stage_svc.run_stage(cid, st)
             except Exception as stage_exc:
@@ -340,7 +402,11 @@ async def _run_one(
             _echo(f"  {result}")
             if isinstance(result, dict):
                 if st == "discover":
-                    detail = f"achou {result.get('companies_found', 0)}"
+                    detail = (
+                        f"achou {result.get('companies_found', 0)} "
+                        f"fila {result.get('queued', 0)} "
+                        f"tent={result.get('discover_attempts', 1)}"
+                    )
                 elif st == "enrich":
                     detail = (
                         f"+{result.get('enriched', 0)} e-mail  "
@@ -360,46 +426,66 @@ async def _run_one(
                     result=result if isinstance(result, dict) else {"raw": str(result)},
                 )
 
+            if st in {"enrich", "crm"}:
+                drain = (
+                    await stage_svc.enrich_ready(
+                        niche=niche, limit=max_results, exclude_campaign_id=cid
+                    )
+                    if st == "enrich"
+                    else await stage_svc.crm_ready(
+                        niche=niche, limit=max_results, exclude_campaign_id=cid
+                    )
+                )
+                if isinstance(result, dict) and isinstance(drain, dict):
+                    for k in ("enriched", "discarded", "synced", "failed"):
+                        if k in drain:
+                            result[k] = int(result.get(k) or 0) + int(drain.get(k) or 0)
+                    result["drained"] = drain.get("seen") or 0
+                    stage_results[st] = result
+                    _echo(f"  drenou {st}: {drain}")
+
             if st == "enrich" and result.get("need_more_discover"):
-                for r in range(3):
-                    if _stop:
-                        break
-                    if not result.get("need_more_discover"):
-                        break
-                    _echo(f"  … reforço discover/enrich {r+1}/3")
-                    try:
-                        await stage_svc.run_stage(cid, "discover")
-                        result = await stage_svc.run_stage(cid, "enrich")
-                    except Exception as reforco_exc:
-                        # não deixa um reforço falho derrubar o job inteiro:
-                        # segue com o que já foi enriquecido até aqui (crm/dispatch).
-                        # rollback é obrigatório: uma exceção a meio de run_stage()
-                        # deixa a sessão numa transação abortada.
-                        await session.rollback()
-                        err = {
-                            "event": "stage_error",
-                            "niche": niche,
-                            "city": city.city,
-                            "state": city.state,
-                            "campaign_id": cid,
-                            "stage": "enrich_retry",
-                            "error": str(reforco_exc),
-                            "error_type": type(reforco_exc).__name__,
-                        }
+                queued_now = int((stage_results.get("discover") or {}).get("queued") or 0)
+                if queued_now > 0:
+                    _echo("  … enrich vazio: candidatos na fila do reviewer (sem reforço SERP)")
+                else:
+                    for r in range(3):
+                        if _stop:
+                            break
+                        if not result.get("need_more_discover"):
+                            break
+                        _echo(f"  … reforço discover/enrich {r+1}/3")
+                        try:
+                            await stage_svc.run_stage(cid, "discover")
+                            result = await stage_svc.run_stage(cid, "enrich")
+                        except Exception as reforco_exc:
+                            await session.rollback()
+                            err = {
+                                "event": "stage_error",
+                                "niche": niche,
+                                "city": city.city,
+                                "state": city.state,
+                                "campaign_id": cid,
+                                "stage": "enrich_retry",
+                                "error": str(reforco_exc),
+                                "error_type": type(reforco_exc).__name__,
+                            }
+                            if file_log:
+                                file_log.error(err)
+                            _echo(
+                                f"  ✗ reforço discover/enrich falhou (seguindo com o que há): {reforco_exc}"
+                            )
+                            break
+                        stage_results["enrich"] = result
+                        _echo(f"  {result}")
                         if file_log:
-                            file_log.error(err)
-                        _echo(f"  ✗ reforço discover/enrich falhou (seguindo com o que há): {reforco_exc}")
-                        break
-                    stage_results["enrich"] = result
-                    _echo(f"  {result}")
-                    if file_log:
-                        file_log.stage(
-                            niche=niche,
-                            city=city.city,
-                            state=city.state,
-                            stage="enrich_retry",
-                            result=result if isinstance(result, dict) else {"raw": str(result)},
-                        )
+                            file_log.stage(
+                                niche=niche,
+                                city=city.city,
+                                state=city.state,
+                                stage="enrich_retry",
+                                result=result if isinstance(result, dict) else {"raw": str(result)},
+                            )
 
         status = await stage_svc.stage_status(cid)
         await session.commit()
@@ -410,6 +496,9 @@ async def _run_one(
         + by.get(ItemStageStatus.ENRICHED.value, 0)
         + by.get(ItemStageStatus.SENT.value, 0)
     )
+    queued = int((stage_results.get("discover") or {}).get("queued") or 0)
+    enriched_n = int((stage_results.get("enrich") or {}).get("enriched") or 0)
+    good = max(good, enriched_n)
     dispatch_info = stage_results.get("dispatch") or {}
     return {
         "event": "job_done",
@@ -419,6 +508,7 @@ async def _run_one(
         "state": city.state,
         "query": query,
         "good": good,
+        "queued": queued,
         "target": max_results,
         "items_by_stage": by,
         "stages": {
@@ -431,7 +521,7 @@ async def _run_one(
         "emails_failed": int(dispatch_info.get("failed") or 0),
         "emails_cooldown": int(dispatch_info.get("cooldown_skipped") or 0),
         "template": dispatch_info.get("template"),
-        "ok": good >= max(1, max_results // 2),
+        "ok": good >= max(1, max_results // 2) or queued > 0,
         "full": good >= max_results,
     }
 
@@ -440,14 +530,31 @@ async def main() -> None:
     global _stop
 
     p = argparse.ArgumentParser(description="Loop de caçada multi-nicho / multi-cidade")
-    p.add_argument("-n", "--max", type=int, default=5, help="Leads por nicho×cidade")
+    p.add_argument("-n", "--max", type=int, default=5, help="Leads por nicho×alvo")
     p.add_argument(
         "--niches",
         default=",".join(DEFAULT_NICHES),
         help="Nichos csv (default: todos)",
     )
-    p.add_argument("--focus-rs", action="store_true", default=True, help="Prioriza RS (default on)")
-    p.add_argument("--no-focus-rs", action="store_true", help="Desliga prioridade RS")
+    p.add_argument(
+        "--nationwide",
+        dest="nationwide",
+        action="store_true",
+        help="Busca em todo o Brasil (default)",
+    )
+    p.add_argument(
+        "--no-nationwide",
+        dest="nationwide",
+        action="store_false",
+        help="Usa escada de cidades em vez de uma busca nacional",
+    )
+    p.add_argument(
+        "--focus-rs",
+        action="store_true",
+        help="Escada de cidades com RS primeiro (desliga busca nacional)",
+    )
+    p.add_argument("--no-focus-rs", action="store_true", help="Sem prioridade RS (já é o default)")
+    p.set_defaults(nationwide=True)
     p.add_argument("--only-rs", action="store_true", help="Só cidades do RS")
     p.add_argument("--only-capitals", action="store_true", help="Só capitais + DF")
     p.add_argument("--max-tier", type=int, default=2, choices=[1, 2, 3])
@@ -539,7 +646,7 @@ async def main() -> None:
     get_settings.cache_clear()
     settings = get_settings()
 
-    focus_rs = args.focus_rs and not args.no_focus_rs
+    focus_rs = bool(args.focus_rs) and not bool(args.no_focus_rs)
     niches = [n.strip() for n in args.niches.split(",") if n.strip()]
     stages = [s.strip() for s in args.stages.split(",") if s.strip()]
     if args.no_dispatch:
@@ -549,12 +656,13 @@ async def main() -> None:
     states = [s.strip().upper() for s in args.states.split(",") if s.strip()] or None
     city_limit = args.city_limit or None
 
-    cities = build_city_queue(
+    cities = resolve_hunt_cities(
+        nationwide=args.nationwide,
         focus_rs=focus_rs,
-        max_tier=args.max_tier,
-        min_population_k=args.min_pop_k,
         only_rs=args.only_rs,
         only_capitals=args.only_capitals,
+        max_tier=args.max_tier,
+        min_population_k=args.min_pop_k,
         limit=city_limit,
         include_states=states,
     )
@@ -563,7 +671,9 @@ async def main() -> None:
     print("=== HUNT LOOP ===", flush=True)
     print(
         f"backend={settings.search_backend} serper={'yes' if settings.serper_api_key else 'no'} "
-        f"llm={settings.hunt_use_llm} model={settings.model}",
+        f"llm={settings.hunt_use_llm} model={settings.model}  "
+        f"review_queue={settings.review_queue_enabled}  "
+        f"(sempre lead NOVO; Qwen é scripts/reviewer.py)",
         flush=True,
     )
     print(
@@ -578,7 +688,9 @@ async def main() -> None:
     )
     if "dispatch" not in stages:
         print("disparo: scripts/mailman.py (este hunt só prospecta)", flush=True)
+        print("validação IA: scripts/reviewer.py (fila Redis → grava ou descarta)", flush=True)
     print(
+        f"nationwide={len(cities) == 1 and cities[0].nationwide} "
         f"focus_rs={focus_rs} only_rs={args.only_rs} max_tier={args.max_tier} "
         f"min_pop_k={args.min_pop_k}",
         flush=True,
@@ -706,6 +818,7 @@ async def main() -> None:
                     jobs_ok += 1
                     msg = (
                         f"  ✓ good={result['good']}/{args.max} "
+                        f"fila={result.get('queued', 0)} "
                         f"emails={result.get('emails_sent', 0)} "
                         f"cooldown_skip={result.get('emails_cooldown', 0)} "
                         f"full={result.get('full')} em {elapsed:.0f}s"

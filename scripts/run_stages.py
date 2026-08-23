@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Roda campanha em etapas: discover → enrich → crm → [dispatch opcional]."""
+"""Roda campanha em etapas: discover → enrich → crm → [dispatch opcional].
+
+Com REVIEW_QUEUE_ENABLED (default), discover só enfileira. Suba
+`python scripts/reviewer.py` para o Qwen gravar ou descartar; o enrich
+drena o que já foi aprovado.
+"""
 
 from __future__ import annotations
 
@@ -23,8 +28,8 @@ async def main() -> None:
     p.add_argument("--name", default="Campanha stages")
     p.add_argument("--niche", required=True)
     p.add_argument("--query", default="")
-    p.add_argument("--city", default="Curitiba")
-    p.add_argument("--state", default="PR")
+    p.add_argument("--city", default="Brasil", help="Cidade (default: Brasil = todo o país)")
+    p.add_argument("--state", default="", help="UF (vazio = nacional)")
     p.add_argument("-n", "--max", type=int, default=5)
     p.add_argument(
         "--stages",

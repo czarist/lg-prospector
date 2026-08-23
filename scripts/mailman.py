@@ -2,7 +2,7 @@
 """Mailman — disparo de e-mail independente da prospecção.
 
 Avalia contatos que não receberam e-mail nos últimos 4 dias e envia
-um lote de 4: 2 nicho + 2 generalista, intervalo aleatório de 2–5 min.
+um lote de 12: 4 geral + 4 prestador + 4 nicho específico, intervalo 2–5 min.
 
 Uso:
   python scripts/mailman.py
@@ -144,11 +144,14 @@ def _fmt_forecast(fc: dict[str, Any] | None) -> str:
         return ""
     n = fc.get("niche") or {}
     g = fc.get("generalista") or {}
+    p = fc.get("prestador") or {}
     return (
         f"nicho {int(n.get('sent') or 0)}/{int(n.get('total') or 0)} "
         f"(prontos {int(n.get('ready') or 0)})  "
         f"geral {int(g.get('sent') or 0)}/{int(g.get('total') or 0)} "
-        f"(prontos {int(g.get('ready') or 0)}  4d {int(g.get('waiting') or 0)})"
+        f"(prontos {int(g.get('ready') or 0)})  "
+        f"prest {int(p.get('sent') or 0)}/{int(p.get('total') or 0)} "
+        f"(prontos {int(p.get('ready') or 0)})"
     )
 
 
@@ -175,8 +178,9 @@ def _print_batch(batch_n: int, result: dict[str, Any]) -> None:
         f"falhas={result.get('failed', 0)} pulados={result.get('skipped', 0)} "
         f"fila={result.get('candidates', 0)} "
         f"nicho={result.get('niche', '?')} gen={result.get('generalista', '?')} "
+        f"prest={result.get('prestador', '?')} "
         f"escolhidos={result.get('picked', 0)} "
-        f"({result.get('picked_niche', '?')}+{result.get('picked_gen', '?')})"
+        f"({result.get('picked_niche', '?')}+{result.get('picked_gen', '?')}+{result.get('picked_prestador', '?')})"
     )
     for row in result.get("results") or []:
         mark = "✓" if row.get("outcome") in {"sent", "dry_run"} else "·"
@@ -254,15 +258,15 @@ async def main() -> None:
     p.add_argument("--plan", action="store_true", help="Só lista a fila e sai")
     p.add_argument(
         "--only",
-        choices=("niche", "generalista"),
+        choices=("niche", "generalista", "prestador"),
         default="",
-        help="Restringe a uma faixa (default: mistura as duas)",
+        help="Restringe a uma faixa (default: 4+4+4)",
     )
     p.add_argument(
         "--batch-size",
         type=int,
         default=settings.mailman_batch_size,
-        help="Disparos por lote (default 4 = 2 nicho + 2 geral)",
+        help="Disparos por lote (default 12 = 4 geral + 4 prestador + 4 nicho)",
     )
     p.add_argument(
         "--min-interval",
@@ -297,7 +301,7 @@ async def main() -> None:
     p.add_argument(
         "--no-intra-pause",
         action="store_true",
-        help="Sem pausa entre os 2 e-mails do mesmo lote",
+        help="Sem pausa entre os e-mails do mesmo lote",
     )
     p.add_argument(
         "--empty-wait",
@@ -445,7 +449,11 @@ async def main() -> None:
                 _echo("max-batches atingido")
                 break
 
-            empty = int(result.get("picked") or 0) == 0
+            empty = int(result.get("picked") or 0) == 0 or (
+                int(result.get("sent") or 0) == 0
+                and int(result.get("failed") or 0) == 0
+                and not result.get("provider_blocked")
+            )
             if empty:
                 wait = max(15.0, float(args.empty_wait))
                 _echo(

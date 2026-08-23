@@ -56,8 +56,8 @@ NICHES: list[tuple[str, list[str], str, str]] = [
             "advogado empresarial",
             "escritório de advocacia site contato",
         ],
-        "Curitiba",
-        "PR",
+        "Brasil",
+        "",
     ),
     (
         "agencia_marketing",
@@ -69,8 +69,8 @@ NICHES: list[tuple[str, list[str], str, str]] = [
             "agência de comunicação",
             "social media agência",
         ],
-        "Curitiba",
-        "PR",
+        "Brasil",
+        "",
     ),
     (
         "empresa_ti",
@@ -82,8 +82,8 @@ NICHES: list[tuple[str, list[str], str, str]] = [
             "empresa de tecnologia ti",
             "consultoria em ti",
         ],
-        "Curitiba",
-        "PR",
+        "Brasil",
+        "",
     ),
     (
         "prestador_servico",
@@ -95,21 +95,21 @@ NICHES: list[tuple[str, list[str], str, str]] = [
             "escritório contábil site contato",
             "empresa de serviços administrativos",
         ],
-        "Curitiba",
-        "PR",
+        "Brasil",
+        "",
     ),
     (
         "grupo_midiatico",
         [
             "jornal portal de notícias",
-            "portal de notícias curitiba",
+            "portal de notícias",
             "jornal regional",
             "grupo de mídia comunicação",
             "rádio jornal site",
             "site de notícias",
         ],
-        "Curitiba",
-        "PR",
+        "Brasil",
+        "",
     ),
     (
         "politico",
@@ -117,19 +117,21 @@ NICHES: list[tuple[str, list[str], str, str]] = [
             "deputado federal gabinete e-mail",
             "deputado estadual contato email",
             "senador gabinete contato",
-            "vereador curitiba contato email",
+            "vereador contato email",
             "partido político diretório contato",
             "gabinete parlamentar email",
         ],
-        "Curitiba",
-        "PR",
+        "Brasil",
+        "",
     ),
 ]
 
 
 def _query_variants(base_queries: list[str], city: str, state: str, round_idx: int) -> list[str]:
     """Gera queries extras por rodada (cidade, estado, página)."""
-    loc = f"{city} {state}".strip()
+    from app.domain.cities import search_location
+
+    loc = search_location(city, state)
     extras = []
     for q in base_queries:
         extras.append(f"{q} {loc}")
@@ -525,8 +527,8 @@ async def main() -> None:
         action="store_true",
         help="NÃO sincronizar EspoCRM (por padrão CRM=SIM: Account+Contact+Lead)",
     )
-    parser.add_argument("--city", default="Curitiba")
-    parser.add_argument("--state", default="PR")
+    parser.add_argument("--city", default="Brasil", help="Cidade (default: Brasil = todo o país)")
+    parser.add_argument("--state", default="", help="UF (vazio = nacional)")
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--max-candidates", type=int, default=200)
     args = parser.parse_args()

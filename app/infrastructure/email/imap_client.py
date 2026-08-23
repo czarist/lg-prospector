@@ -167,7 +167,10 @@ class ImapMailbox:
 
         for crit in criteria:
             try:
-                typ, data = self._conn.uid("SEARCH", None, crit)
+                if any(ord(c) > 127 for c in crit):
+                    typ, data = self._conn.uid("SEARCH", "CHARSET", "UTF-8", crit)
+                else:
+                    typ, data = self._conn.uid("SEARCH", None, crit)
             except Exception as exc:
                 logger.debug("imap_search_failed", criteria=crit, error=str(exc))
                 continue

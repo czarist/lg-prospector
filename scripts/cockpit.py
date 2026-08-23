@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Sobe nicho + generalista + mailman e abre o painel.
+"""Sobe nicho + generalista + reviewer + auditor + mailman e abre o painel.
 
   ./cockpit          # sobe o que faltar + painel
   ./cockpit --attach # só o painel
-  ./cockpit --stop   # encerra os três
+  ./cockpit --stop   # encerra os cinco
 
 q fecha o painel. Os processos continuam. --stop derruba.
 """
@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,7 @@ from app import __version__
 from app.core.health import HealthWatch
 from app.core.live import read_live
 from app.core.paths import logs_dir
-from app.domain.cities import DEFAULT_NICHES, build_city_queue
+from app.domain.cities import DEFAULT_NICHES
 
 
 def _session_path() -> Path:
@@ -49,6 +49,8 @@ def _gen_jsonl() -> Path:
 SCRIPTS = {
     "nicho": ROOT / "scripts" / "hunt_loop.py",
     "generalista": ROOT / "scripts" / "hunt_generalista.py",
+    "reviewer": ROOT / "scripts" / "reviewer.py",
+    "auditor": ROOT / "scripts" / "auditor.py",
     "mailman": ROOT / "scripts" / "mailman.py",
 }
 def _console_logs() -> dict[str, Path]:
@@ -56,20 +58,24 @@ def _console_logs() -> dict[str, Path]:
     return {
         "nicho": root / "hunt" / "console_loop.log",
         "generalista": root / "hunt" / "console_generalista.log",
+        "reviewer": root / "reviewer" / "console.log",
+        "auditor": root / "auditor" / "console.log",
         "mailman": root / "mailman" / "console.log",
     }
 CMDS: dict[str, list[str]] = {
     "nicho": [
-        "--focus-rs", "--max-tier", "3", "--min-pop-k", "50", "-n", "10",
+        "--nationwide", "--max-tier", "3", "--min-pop-k", "50", "-n", "10",
         "--stages", "discover,enrich,crm",
         "--pause", "8", "--cycle-pause", "60", "--max-partial-attempts", "5",
     ],
     "generalista": [
-        "--focus-rs", "--max-tier", "3", "--min-pop-k", "50", "-n", "8",
+        "--nationwide", "--max-tier", "3", "--min-pop-k", "50", "-n", "8",
         "--pause", "8", "--cycle-pause", "60",
     ],
+    "reviewer": [],
+    "auditor": [],
     "mailman": [
-        "--batch-size", "4", "--min-interval", "120", "--max-interval", "300",
+        "--batch-size", "12", "--min-interval", "120", "--max-interval", "300",
         "--cooldown-days", "4", "--wait-days", "4",
     ],
 }
@@ -216,8 +222,8 @@ def _gen_avg() -> float:
 
 
 def _queue_totals() -> tuple[int, int]:
-    cities = build_city_queue(focus_rs=True, max_tier=3, min_population_k=50)
-    return len(cities) * max(1, len(DEFAULT_NICHES)), len(cities)
+    cities = 1  # alvo nacional (Brasil)
+    return cities * max(1, len(DEFAULT_NICHES)), cities
 
 
 def _last_log_line(path: Path) -> str:
@@ -251,13 +257,33 @@ def _today_hunt_stats() -> dict[str, Any]:
     """Soma job_done de hoje pelo timestamp — o hunt pode gravar no arquivo de ontem."""
     jobs = 0
     leads = 0
-    for path in _hunt_results().glob("results_*.jsonl"):
+    today = datetime.now().strftime("%Y%m%d")
+    yest = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    for day in (yest, today):
+        path = _hunt_results() / f"results_{day}.jsonl"
+        if not path.is_file():
+            continue
         for row in _iter_jsonl(path):
             if row.get("event") != "job_done" or not _is_local_today(row.get("ts")):
                 continue
             jobs += 1
             leads += int(row.get("good") or 0)
     return {"jobs": jobs, "leads": leads}
+
+
+_SNAP_CACHE: dict[str, Any] = {"t": 0.0}
+
+
+def _cached_counts() -> dict[str, Any]:
+    now = time.time()
+    if now - float(_SNAP_CACHE.get("t") or 0) < 8:
+        return _SNAP_CACHE
+    _SNAP_CACHE["hunt"] = _today_hunt_stats()
+    _SNAP_CACHE["gen"] = _today_gen_stats()
+    _SNAP_CACHE["hunt_avg"] = _hunt_avg()
+    _SNAP_CACHE["gen_avg"] = _gen_avg()
+    _SNAP_CACHE["t"] = now
+    return _SNAP_CACHE
 
 
 def _today_gen_stats() -> dict[str, Any]:
@@ -312,7 +338,12 @@ def _forecast_from_live(live: dict[str, Any]) -> dict[str, Any]:
             "cooldown": live.get("gen_cooldown"),
             "total": live.get("gen_total"),
         }
-    return {"niche": _lane(nicho), "generalista": _lane(geral)}
+    prest = nested.get("prestador") if isinstance(nested, dict) else None
+    return {
+        "niche": _lane(nicho),
+        "generalista": _lane(geral),
+        "prestador": _lane(prest),
+    }
 
 
 class ForecastWatch:
@@ -422,12 +453,37 @@ def _alive(pid: int) -> bool:
         return False
 
 
+def _rotate_if_large(path: Path, *, max_bytes: int = 80 * 1024 * 1024, keep: int = 3) -> None:
+    try:
+        if not path.is_file() or path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    archived = path.with_name(f"{path.name}.{stamp}")
+    try:
+        path.rename(archived)
+    except OSError:
+        return
+    siblings = sorted(
+        (p for p in path.parent.glob(f"{path.name}.*") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for old in siblings[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def start_worker(name: str) -> tuple[int, str]:
     existing = [p for p in find_pids(SCRIPTS[name].name) if _alive(p)]
     if existing:
         return existing[0], "já rodava"
     log_path = _console_logs()[name]
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_if_large(log_path)
     log_fh = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
     log_fh.write(f"\n── cockpit {_now().isoformat()} ──\n")
     log_fh.flush()
@@ -491,8 +547,9 @@ def _put(stdscr: Any, y: int, x: int, text: str, attr: int = 0) -> None:
 
 def _snapshot(forecast: dict[str, Any] | None = None) -> dict[str, Any]:
     hunt_jobs, gen_cities = _queue_totals()
-    hunt_avg = _hunt_avg()
-    gen_avg = _gen_avg()
+    cached = _cached_counts()
+    hunt_avg = float(cached.get("hunt_avg") or _AVG_HUNT_JOB)
+    gen_avg = float(cached.get("gen_avg") or _AVG_GEN_CITY)
     now = _now()
     workers: dict[str, dict[str, Any]] = {}
     snap_forecast = forecast if forecast and (forecast.get("niche") or forecast.get("generalista")) else None
@@ -585,6 +642,59 @@ def _snapshot(forecast: dict[str, Any] | None = None) -> dict[str, Any]:
                     "last": last,
                 }
             )
+        elif name == "reviewer":
+            qlen = live.get("queue")
+            kept = live.get("kept_total")
+            dropped = live.get("dropped_total")
+            row.update(
+                {
+                    "title": "REVIEWER",
+                    "label": live.get("last_line") or "aguardando fila",
+                    "phase": live.get("phase") or ("rodando" if running else "parado"),
+                    "pipeline": "Qwen local  ·  hunt enfileira, daqui grava ou descarta",
+                    "progress": f"fila {qlen if qlen is not None else '—'}",
+                    "cycle": None,
+                    "pct": None,
+                    "spent": None,
+                    "remain": None,
+                    "overtime": False,
+                    "eta_cycle": None,
+                    "avg": 8.0,
+                    "detail": (
+                        f"keep {kept if kept is not None else 0}  "
+                        f"drop {dropped if dropped is not None else 0}"
+                        + (f"  {live.get('last_name')}" if live.get("last_name") else "")
+                    ),
+                    "last": live.get("last_line") or "",
+                }
+            )
+        elif name == "auditor":
+            row.update(
+                {
+                    "title": "AUDITOR",
+                    "label": live.get("last_line") or "aguardando leads salvos",
+                    "phase": live.get("phase") or ("rodando" if running else "parado"),
+                    "pipeline": "modelos remotos  ·  bounce IMAP  ·  análise + lacunas, não apaga",
+                    "progress": (
+                        f"fila {live.get('pending') if live.get('pending') is not None else '—'}  "
+                        f"rev {live.get('reviewed') if live.get('reviewed') is not None else '—'}"
+                    ),
+                    "cycle": None,
+                    "pct": None,
+                    "spent": None,
+                    "remain": None,
+                    "overtime": False,
+                    "eta_cycle": None,
+                    "avg": 18.0,
+                    "detail": (
+                        f"keep {live.get('kept') or 0}  "
+                        f"recuperou {live.get('recovered') or 0}  "
+                        f"enriqueceu {live.get('enriched') or 0}"
+                        + (f"  {live.get('model')}" if live.get("model") else "")
+                    ),
+                    "last": live.get("last_line") or "",
+                }
+            )
         else:
             next_at = _parse_ts(live.get("next_at"))
             until = (next_at - now).total_seconds() if next_at else None
@@ -593,20 +703,17 @@ def _snapshot(forecast: dict[str, Any] | None = None) -> dict[str, Any]:
             fc = snap_forecast or _forecast_from_live(live)
             n = _lane((fc or {}).get("niche"))
             g = _lane((fc or {}).get("generalista"))
-            has_fc = bool(n["total"] or g["total"])
+            p = _lane((fc or {}).get("prestador"))
+            has_fc = bool(n["total"] or g["total"] or p["total"])
             if has_fc:
                 label = (
-                    f"nicho {n['sent']}/{n['total']} enviados"
-                    f"   geral {g['sent']}/{g['total']} enviados"
+                    f"nicho {n['sent']}/{n['total']}  "
+                    f"geral {g['sent']}/{g['total']}  "
+                    f"prest {p['sent']}/{p['total']}"
                 )
                 detail = (
-                    f"prontos nicho {n['ready']}  geral {g['ready']}"
+                    f"prontos n{n['ready']} g{g['ready']} p{p['ready']}"
                     + (f"  libera 4d {g['waiting']}" if g["waiting"] else "")
-                    + (
-                        f"  cooldown {n['cooldown']}+{g['cooldown']}"
-                        if (n["cooldown"] or g["cooldown"])
-                        else ""
-                    )
                 )
             else:
                 label = live.get("last_line") or "avaliando fila"
@@ -629,7 +736,7 @@ def _snapshot(forecast: dict[str, Any] | None = None) -> dict[str, Any]:
                     "title": "MAILMAN",
                     "label": label,
                     "phase": live.get("phase") or ("rodando" if running else "parado"),
-                    "pipeline": "2+2, completa com a outra faixa  ·  nicho também recebe o geral",
+                    "pipeline": "4 geral + 4 prestador + 4 nicho  ·  prestador é faixa geral",
                     "progress": f"lote {live.get('batch')}" if live.get("batch") else "lote —",
                     "cycle": None,
                     "pct": None,
@@ -650,8 +757,8 @@ def _snapshot(forecast: dict[str, Any] | None = None) -> dict[str, Any]:
             )
         workers[name] = row
 
-    hunt = _today_hunt_stats()
-    gen = _today_gen_stats()
+    hunt = cached.get("hunt") or {"jobs": 0, "leads": 0}
+    gen = cached.get("gen") or {"leads": 0}
     mail = _today_mail_stats()
     live_mail = read_live("mailman")
     fc = snap_forecast or _forecast_from_live(live_mail)
@@ -673,10 +780,12 @@ def _header_mail(snap: dict[str, Any]) -> str:
     fc = snap.get("forecast") or {}
     n = _lane(fc.get("niche"))
     g = _lane(fc.get("generalista"))
-    if n["total"] or g["total"]:
+    p = _lane(fc.get("prestador"))
+    if n["total"] or g["total"] or p["total"]:
         return (
-            f"mailman nicho {n['sent']}/{n['total']}  "
-            f"geral {g['sent']}/{g['total']}"
+            f"mailman n {n['sent']}/{n['total']}  "
+            f"g {g['sent']}/{g['total']}  "
+            f"p {p['sent']}/{p['total']}"
         )
     return f"{snap.get('mail_sent') or 0} e-mails mailman"
 
@@ -1045,13 +1154,13 @@ def _draw_card(stdscr: Any, y: int, w: int, row: dict[str, Any]) -> int:
     y += 1
 
     _put(stdscr, y, 1, "└" + _hline(inner) + "┘", color)
-    return y + 1  # próximo card colado — 24 linhas cabem os 3
+    return y + 1  # próximo card colado — 5 workers pedem terminal alto
 
 
 def _draw(stdscr: Any, boot_at: float) -> None:
     curses.curs_set(0)
     stdscr.nodelay(True)
-    stdscr.timeout(400)
+    stdscr.timeout(900)
     if curses.has_colors():
         curses.start_color()
         curses.use_default_colors()
@@ -1078,7 +1187,7 @@ def _draw(stdscr: Any, boot_at: float) -> None:
                 stdscr,
                 0,
                 1,
-                f" LG PROSPECTOR  v{__version__}   {clock}   up {up}   {alive_n}/3 no ar",
+                f" LG PROSPECTOR  v{__version__}   {clock}   up {up}   {alive_n}/5 no ar",
                 curses.A_BOLD,
             )
             _put(stdscr, 0, max(1, w - 20), "q fecha  --stop mata", curses.A_DIM)
@@ -1098,7 +1207,7 @@ def _draw(stdscr: Any, boot_at: float) -> None:
             elif h >= 28:
                 y = _draw_infra(stdscr, y, w, health, full=False)
 
-            for key in ("nicho", "generalista", "mailman"):
+            for key in ("nicho", "generalista", "reviewer", "auditor", "mailman"):
                 if y + 6 > h - 1:
                     break
                 y = _draw_card(stdscr, y, w, snap["workers"][key])
@@ -1146,7 +1255,7 @@ def _print_snapshot() -> None:
     for line in _machine_lines(machine, full=True):
         print(line, flush=True)
     print(_services_line(health.get("services") or {}), flush=True)
-    for key in ("nicho", "generalista", "mailman"):
+    for key in ("nicho", "generalista", "reviewer", "auditor", "mailman"):
         row = snap["workers"][key]
         mark = "●" if row["running"] else "○"
         print(f"{mark} {row['title']:<12} {row.get('progress')}  {row.get('label')}", flush=True)
@@ -1162,21 +1271,21 @@ def _print_snapshot() -> None:
 
 def main() -> None:
     global _stop
-    p = argparse.ArgumentParser(description="Sobe os dois hunts + mailman e abre o painel")
+    p = argparse.ArgumentParser(description="Sobe hunts + reviewer + auditor + mailman e abre o painel")
     p.add_argument("--attach", action="store_true", help="Só o painel")
-    p.add_argument("--stop", action="store_true", help="Encerra os três e sai")
+    p.add_argument("--stop", action="store_true", help="Encerra os cinco e sai")
     p.add_argument("--no-tui", action="store_true", help="Sobe (se faltar) e imprime um snapshot")
     args = p.parse_args()
 
     if args.stop:
-        print("encerrando nicho, generalista e mailman…", flush=True)
+        print("encerrando nicho, generalista, reviewer, auditor e mailman…", flush=True)
         stop_all()
         print("ok", flush=True)
         return
 
     if not args.attach:
         notes = {}
-        for name in ("nicho", "generalista", "mailman"):
+        for name in ("nicho", "generalista", "reviewer", "auditor", "mailman"):
             pid, how = start_worker(name)
             notes[name] = {"pid": pid, "how": how}
             print(f"  {name:<12} {how:<10} pid {pid}", flush=True)

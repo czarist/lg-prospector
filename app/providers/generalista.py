@@ -34,6 +34,16 @@ _SECTOR_QUERIES = (
     "hotel pousada site",
     "escritório empresa site contato",
     "academia estética salão site",
+    "farmácia drogaria site contato",
+    "construtora engenharia site",
+    "transportadora logística site",
+    "pet shop veterinária site",
+    "padaria supermercado site",
+    "autopeças pneus site",
+    "gráfica comunicação visual site",
+    "contabilidade escritório site",
+    "óptica joalheria site",
+    "escola curso profissionalizante site",
 )
 
 
@@ -47,9 +57,11 @@ class GeneralistaProvider(SearchProviderMixin, BaseProvider):
     source_label = ORIGIN
 
     def _queries(self, ctx: SearchContext) -> list[str]:
+        from app.domain.cities import search_location
+
         city = (ctx.city or "").strip()
         state = (ctx.state or "").strip()
-        loc = " ".join(x for x in (city, state) if x)
+        loc = search_location(city, state)
         q = (ctx.query or "").strip()
         out: list[str] = []
         if q:
@@ -57,8 +69,10 @@ class GeneralistaProvider(SearchProviderMixin, BaseProvider):
         seed = sum(ord(c) for c in (city or state or "br"))
         n = len(_SECTOR_QUERIES)
         round_idx = int((ctx.extra or {}).get("discover_round") or 0)
-        start = (seed + round_idx) % n
-        picked = [_SECTOR_QUERIES[(start + i * 3) % n] for i in range(4)]
+        # cada visita / retry começa noutro setor — não recicla o mesmo SERP
+        start = (seed + round_idx * 5) % n
+        take = min(n, 8)
+        picked = [_SECTOR_QUERIES[(start + i) % n] for i in range(take)]
         for p in picked:
             out.append(f"{p} {loc}".strip())
         return [x for x in out if len(x) > 8]
@@ -105,12 +119,44 @@ class GeneralistaProvider(SearchProviderMixin, BaseProvider):
         return pr
 
     async def search_companies(self, ctx: SearchContext) -> list[ProviderResult]:
+        from app.providers.domain_email import extract_registrable_domain
+
         pool: list[ProviderResult] = []
         seen: set[str] = set()
         target = max(ctx.max_results * 3, 12)
+        extra_ctx = ctx.extra or {}
+        exclude_hosts = {
+            str(h).strip().lower()
+            for h in (extra_ctx.get("exclude_hosts") or [])
+            if h
+        }
+        exclude_names = {
+            str(n).strip().lower()
+            for n in (extra_ctx.get("exclude_names") or [])
+            if n
+        }
+        exclude_emails = {
+            str(e).strip().lower()
+            for e in (extra_ctx.get("exclude_emails") or [])
+            if e
+        }
+
+        def _is_known(pr: ProviderResult) -> bool:
+            host = extract_registrable_domain(pr.website or "")
+            if host and host.lower() in exclude_hosts:
+                return True
+            name = (pr.company_name or "").strip().lower()
+            if name and name in exclude_names:
+                return True
+            em = (pr.email or "").strip().lower()
+            if em and em in exclude_emails:
+                return True
+            return False
 
         def _add(pr: ProviderResult | None) -> None:
-            if not pr:
+            if not pr or _is_known(pr):
+                return
+            if not pr.is_valid_company():
                 return
             key = pr.normalize_key()
             if key in seen:
@@ -137,7 +183,11 @@ class GeneralistaProvider(SearchProviderMixin, BaseProvider):
             if len(pool) >= target:
                 break
             more = await self._search_organic(
-                q, max(8, ctx.max_results), city=ctx.city, state=ctx.state
+                q,
+                max(8, ctx.max_results),
+                city=ctx.city,
+                state=ctx.state,
+                ctx=ctx,
             )
             for r in more:
                 r.segment = self.segment
@@ -195,7 +245,7 @@ class GeneralistaProvider(SearchProviderMixin, BaseProvider):
                 )
                 continue
             em = kept.email.lower()
-            if em in seen_email:
+            if em in seen_email or em in exclude_emails:
                 continue
             seen_email.add(em)
             extra = dict(kept.extra or {})

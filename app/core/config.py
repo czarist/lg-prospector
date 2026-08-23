@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     crm_url: str = "https://trentincrm.com.br/api/v1"
     crm_user: str = "admin"
     crm_password: str = ""
+    # id do User no Espo para Task.assignedUserId; vazio = GET /App/user
+    crm_assigned_user_id: str = ""
 
     # EspoCRM preferencial (API.md): URL + token (API key ou "user:password")
     espo_crm_url: str = ""
@@ -78,8 +80,8 @@ class Settings(BaseSettings):
     google_cse_id: str = ""
     serper_api_key: str = ""
 
-    # free = DuckDuckGo + OSM/Overpass | serper = só Serper (sem fallback DDG)
-    # auto = Serper se SERPER_API_KEY estiver setada, senão free
+    # free = DuckDuckGo + OSM/Overpass
+    # serper / auto com key = Serper; sem crédito cai no DDG/OSM
     search_backend: str = "auto"
 
     # Scraping local (substitui Firecrawl)
@@ -91,8 +93,8 @@ class Settings(BaseSettings):
     # Concorrência baixa = máquina e LiteLLM/Qwen respiram
     search_concurrency: int = 1
     search_min_interval_seconds: float = 0.9
-    # free search: quantos backends tentar (1=só DDG html, 2=+lib, 3=+bing)
-    search_max_backends: int = 2
+    # free search: 1=só Bing, 2=+ddgs, 3=+DDG html
+    search_max_backends: int = 3
     # enrich
     enrich_concurrency: int = 1
     enrich_batch_pause_seconds: float = 0.4
@@ -106,7 +108,8 @@ class Settings(BaseSettings):
     # pro filtro LLM decidir; evita rodadas inteiras de "reforço" (que sim são caras,
     # cada uma refaz discover+enrich com scrape/DDG).
     discover_overfetch_factor: int = 5
-    # LLM local (LiteLLM/Qwen) — OFF por padrão; caçada atual não depende dele
+    # LLM local (LiteLLM/Qwen). A caçada NÃO chama o modelo: enfileira o
+    # candidato e o processo `scripts/reviewer.py` valida e grava ou descarta.
     hunt_use_llm: bool = True
     # keep=true do LLM só é aceito se o score também bater esse mínimo
     # (pega os casos em que o modelo marca keep=true por inércia mas dá score baixo)
@@ -114,6 +117,23 @@ class Settings(BaseSettings):
     llm_concurrency: int = 1
     llm_timeout_seconds: float = 60.0
     llm_max_tokens: int = 140
+    # fila de revisão (Redis) — hunt só busca; reviewer grava
+    review_queue_enabled: bool = True
+    review_queue_name: str = "lg:review"
+    review_pause_seconds: float = 0.4
+    review_seen_ttl_seconds: int = 7 * 24 * 3600
+
+    # Auditor — revalida leads JÁ cadastrados com modelos remotos (nunca Qwen local)
+    auditor_model: str = "groq-fast"
+    auditor_fallback_models: str = (
+        "gemini-free,mistral-agent,cerebras-fast,nim-agent,github-models"
+    )
+    auditor_pause_seconds: float = 2.0
+    auditor_imap_since_days: int = 30
+    auditor_search_hits: int = 10
+    auditor_max_tokens: int = 1600
+    auditor_timeout_seconds: float = 120.0
+    auditor_scrape_pages: int = 3
 
     # Dispatch e-mail
     email_cooldown_days: int = 4  # não reenviar pro mesmo endereço em menos de N dias
@@ -123,8 +143,8 @@ class Settings(BaseSettings):
     email_hourly_limit: int = 0
     email_daily_limit: int = 0
 
-    # Mailman — disparo separado da prospecção (2 e-mails, pausa 2–5 min)
-    mailman_batch_size: int = 4
+    # Mailman — 12 e-mails: 4 geral + 4 prestador + 4 nicho específico
+    mailman_batch_size: int = 12
     mailman_interval_min_seconds: float = 120.0
     mailman_interval_max_seconds: float = 300.0
     mailman_intra_batch_min_seconds: float = 20.0

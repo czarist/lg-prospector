@@ -78,7 +78,9 @@ class ProviderResult(BaseModel):
         # títulos de artigo/blog costumam ter ":", "?" ou ser muito longos
         if len(name) > 120:
             return False
-        if any(x in name for x in ("?", " o que é", "o que e ", "conheça os", "tipos e")):
+        if ":" in name and len(name) > 40:
+            return False
+        if any(x in name.lower() for x in ("?", " o que é", "o que e ", "conheça os", "tipos e", "wikipedia")):
             return False
 
         host = (self.website or "").lower()

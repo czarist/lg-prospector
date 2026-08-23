@@ -134,53 +134,12 @@ class StageService:
             f"empresa {base_q} {campaign.city or ''}".strip(),
         ]
         q = query_variants[round_idx % len(query_variants)] or base_q
-        ctx = SearchContext(
-            query=q,
-            city=campaign.city or "",
-            state=campaign.state or "",
-            max_results=fetch_n,
-            extra={"discover_round": round_idx, "query_round": round_idx},
-        )
-        found = await provider.search_companies(ctx)
 
-        # filtro LLM opcional (serial, 1 por vez) — default OFF
-        if settings.hunt_use_llm and found:
-            from app.infrastructure.llm.client import score_company_candidate
-
-            filtered = []
-            for pr in found:
-                score = await score_company_candidate(
-                    name=pr.company_name or "",
-                    website=pr.website or "",
-                    snippet=str((pr.extra or {}).get("snippet") or ""),
-                    niche=campaign.niche,
-                    city=campaign.city or "",
-                )
-                if score.get("keep", True) and int(score.get("score") or 0) >= settings.discover_min_llm_score:
-                    # aplica nome limpo quando o modelo devolver
-                    cn = (score.get("clean_name") or "").strip()
-                    if cn and len(cn) > 2:
-                        pr.company_name = cn[:191]
-                    extra = dict(pr.extra or {})
-                    extra["llm_score"] = {
-                        "score": score.get("score"),
-                        "reason": score.get("reason"),
-                        "confidence": score.get("confidence"),
-                    }
-                    pr.extra = extra
-                    filtered.append(pr)
-                else:
-                    logger.info(
-                        "discover_llm_discard",
-                        name=pr.company_name,
-                        reason=score.get("reason"),
-                        score=score.get("score"),
-                    )
-            found = filtered
-
-        # já existentes nesta campanha (domínio / nome)
+        # já conhecidos — o provider recebe a lista e continua buscando
+        # até achar lead NOVO, em vez de reciclar o mesmo SERP
         existing_hosts: set[str] = set()
         existing_names: set[str] = set()
+        existing_emails: set[str] = set()
         prev_items = (
             await self.session.execute(
                 select(CampaignItem)
@@ -197,21 +156,23 @@ class StageService:
             n = _normalize_company_name(raw.get("company_name") or "")
             if n:
                 existing_names.add(n)
+        from app.domain.cities import is_nationwide
 
-        # já existentes globalmente (outras campanhas/ciclos) — ignora o que
-        # já foi pesquisado: mesmo host em qualquer cidade, mesmo nome na cidade
-        city_rows = (
-            await self.session.execute(
-                select(Company.name, Company.website_host).where(
-                    Company.city == (campaign.city or "")
+        if not is_nationwide(campaign.city or "", campaign.state or ""):
+            city_rows = (
+                await self.session.execute(
+                    select(Company.name, Company.website_host, Company.email).where(
+                        Company.city == (campaign.city or "")
+                    )
                 )
-            )
-        ).all()
-        for g_name, g_host in city_rows:
-            if g_name:
-                existing_names.add(_normalize_company_name(g_name))
-            if g_host:
-                existing_hosts.add(g_host.strip().lower())
+            ).all()
+            for g_name, g_host, g_email in city_rows:
+                if g_name:
+                    existing_names.add(_normalize_company_name(g_name))
+                if g_host:
+                    existing_hosts.add(g_host.strip().lower())
+                if g_email:
+                    existing_emails.add(g_email.strip().lower())
         host_rows = (
             await self.session.execute(
                 select(Company.website_host).where(Company.website_host.is_not(None))
@@ -220,6 +181,99 @@ class StageService:
         for g_host in host_rows:
             if g_host:
                 existing_hosts.add(g_host.strip().lower())
+
+        ctx = SearchContext(
+            query=q,
+            city=campaign.city or "",
+            state=campaign.state or "",
+            max_results=fetch_n,
+            extra={
+                "discover_round": round_idx,
+                "query_round": round_idx,
+                "exclude_hosts": list(existing_hosts),
+                "exclude_names": list(existing_names),
+                "exclude_emails": list(existing_emails),
+            },
+        )
+        found = await provider.search_companies(ctx)
+
+        cfg["discover_round"] = round_idx + 1
+        campaign.config = cfg
+        campaign.current_stage = CampaignStage.DISCOVER.value
+        campaign.provider = provider.code
+
+        # fila de revisão: a caçada não chama Qwen nem grava lead
+        if settings.review_queue_enabled:
+            from app.services.review_service import ReviewService
+
+            queued = await ReviewService(self.session).enqueue_campaign_hits(campaign, found)
+            await self._log(
+                campaign.id,
+                "stage_discover",
+                f"enfileiradas={queued} round={round_idx} q={q!r} (alvo_final={campaign.max_results})",
+            )
+            await self.session.flush()
+            logger.info(
+                "stage_discover_queued",
+                campaign_id=campaign.id,
+                queued=queued,
+                pool=len(found),
+                round=round_idx,
+            )
+            return {
+                "stage": "discover",
+                "companies_found": 0,
+                "queued": queued,
+                "round": round_idx,
+                "query_used": q,
+                "next": CampaignStage.ENRICH.value,
+            }
+
+        created = await self.persist_discovered(
+            campaign,
+            found,
+            existing_hosts=existing_hosts,
+            existing_names=existing_names,
+            existing_emails=existing_emails,
+        )
+        await self._log(
+            campaign.id,
+            "stage_discover",
+            f"encontradas={created} round={round_idx} q={q!r} (alvo_final={campaign.max_results})",
+        )
+        await self.session.flush()
+        logger.info("stage_discover_done", campaign_id=campaign.id, created=created, round=round_idx)
+        return {
+            "stage": "discover",
+            "companies_found": created,
+            "queued": 0,
+            "round": round_idx,
+            "query_used": q,
+            "next": CampaignStage.ENRICH.value,
+        }
+
+    async def persist_discovered(
+        self,
+        campaign: Campaign,
+        found: list[ProviderResult],
+        *,
+        existing_hosts: set[str] | None = None,
+        existing_names: set[str] | None = None,
+        existing_emails: set[str] | None = None,
+    ) -> int:
+        """Grava Company + item discovered. Chamado pelo reviewer (após Qwen) ou fallback."""
+        existing_hosts = set(existing_hosts or [])
+        existing_names = set(existing_names or [])
+        existing_emails = set(existing_emails or [])
+        if not existing_hosts:
+            host_rows = (
+                await self.session.execute(
+                    select(Company.website_host).where(Company.website_host.is_not(None))
+                )
+            ).scalars().all()
+            for g_host in host_rows:
+                if g_host:
+                    existing_hosts.add(g_host.strip().lower())
 
         seen: set[str] = set()
         created = 0
@@ -237,6 +291,9 @@ class StageService:
             if domain and domain.lower() in existing_hosts:
                 continue
             if name_l and name_l in existing_names:
+                continue
+            pr_email = (pr.email or "").strip().lower()
+            if pr_email and pr_email in existing_emails:
                 continue
 
             website_host = domain or None
@@ -280,15 +337,22 @@ class StageService:
                 extra=pr.extra,
             )
             self.session.add(company)
+            dup_name = company.name
+            dup_city = company.city
             try:
                 async with self.session.begin_nested():
                     await self.session.flush()
             except IntegrityError:
-                self.session.expunge(company)
+                # o rollback do savepoint já tira a instância da Session
+                if company in self.session:
+                    try:
+                        self.session.expunge(company)
+                    except Exception:
+                        pass
                 logger.info(
                     "discover_duplicate_skipped",
-                    name=company.name,
-                    city=company.city,
+                    name=dup_name,
+                    city=dup_city,
                     host=website_host,
                 )
                 if website_host:
@@ -314,24 +378,8 @@ class StageService:
             if name_l:
                 existing_names.add(name_l)
 
-        cfg["discover_round"] = round_idx + 1
-        campaign.config = cfg
-        campaign.current_stage = CampaignStage.DISCOVER.value
-        campaign.provider = provider.code
-        await self._log(
-            campaign.id,
-            "stage_discover",
-            f"encontradas={created} round={round_idx} q={q!r} (alvo_final={campaign.max_results})",
-        )
         await self.session.flush()
-        logger.info("stage_discover_done", campaign_id=campaign.id, created=created, round=round_idx)
-        return {
-            "stage": "discover",
-            "companies_found": created,
-            "round": round_idx,
-            "query_used": q,
-            "next": CampaignStage.ENRICH.value,
-        }
+        return created
 
     # ------------------------------------------------------------------
     # 2) ENRICH — e-mail do domínio
@@ -356,86 +404,11 @@ class StageService:
         for item in items:
             if enriched >= target:
                 break
-            company = item.company
-            if not company:
-                item.stage = ItemStageStatus.DISCARDED.value
-                item.status = ItemStatus.SKIPPED.value
+            status = await self._enrich_item(item, campaign, pause=pause)
+            if status == "enriched":
+                enriched += 1
+            elif status == "discarded":
                 discarded += 1
-                continue
-
-            # pré-filtro barato (sem scrape/LLM)
-            raw = item.raw_data or {}
-            seed_email = (company.email or raw.get("email") or "") or ""
-            pr = ProviderResult(
-                company_name=company.name,
-                website=company.website or "",
-                phone=company.phone or "",
-                email=seed_email,
-                city=company.city or "",
-                state=company.state or "",
-                segment=company.segment or campaign.niche,
-                source=company.source or "",
-                contact_name=(raw.get("contact_name") or "") or "",
-                extra=company.extra or raw,
-            )
-            if not pr.is_valid_company():
-                item.stage = ItemStageStatus.DISCARDED.value
-                item.status = ItemStatus.SKIPPED.value
-                item.error_message = "candidato inválido/lixo"
-                discarded += 1
-                logger.info("enrich_prefilter_discard", company=company.name)
-                continue
-
-            domain = item.company_domain or extract_registrable_domain(company.website or "")
-            niche_l = (campaign.niche or "").lower()
-            is_politico = niche_l in {"politico", "partido"}
-            is_generalista = niche_l == "generalista"
-            # político/generalista: aceita free-mail; não exige e-mail = domínio do site
-            require_domain = bool(domain) and not is_politico and not is_generalista
-            kept = await require_email(
-                pr,
-                deep=True,
-                require_domain=require_domain,
-                allow_free_mail=is_politico or is_generalista or not domain,
-            )
-            if not kept or not has_valid_email(kept.email):
-                item.stage = ItemStageStatus.DISCARDED.value
-                item.status = ItemStatus.SKIPPED.value
-                item.error_message = "sem e-mail"
-                discarded += 1
-                logger.info("enrich_discarded", company=company.name, domain=domain)
-                if pause:
-                    await asyncio.sleep(pause)
-                continue
-
-            company.email = kept.email
-            if kept.phone:
-                company.phone = kept.phone
-            if kept.website and not company.website:
-                company.website = kept.website
-                company.website_host = extract_registrable_domain(kept.website)
-
-            contact = Contact(
-                id=uuid4().hex,
-                company_id=company.id,
-                name=(kept.contact_name or company.name)[:255],
-                email=kept.email,
-                phone=kept.phone or company.phone,
-                source=kept.source,
-                extra=kept.extra,
-            )
-            self.session.add(contact)
-            await self.session.flush()
-
-            item.contact_id = contact.id
-            item.stage = ItemStageStatus.ENRICHED.value
-            item.status = ItemStatus.EMAIL_FOUND.value
-            item.company_domain = domain or extract_registrable_domain(company.website or "")
-            item.qualification_notes = f"email domínio={item.company_domain}"
-            item.raw_data = {**(item.raw_data or {}), **kept.model_dump()}
-            enriched += 1
-            if pause:
-                await asyncio.sleep(pause)
 
         # flush para a contagem refletir discarded/enriched desta rodada
         await self.session.flush()
@@ -470,6 +443,95 @@ class StageService:
             "next": CampaignStage.CRM.value,
         }
 
+    async def enrich_ready(
+        self,
+        *,
+        niche: str,
+        limit: int,
+        exclude_campaign_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Enriquece itens já validados (discovered) de qualquer campanha do nicho.
+
+        A caçada enfileira; o reviewer grava discovered noutro momento.
+        O enrich da campanha da vez pode vir vazio — esta drenagem pega o que
+        o Qwen já aprovou.
+        """
+        from app.core.config import get_settings
+
+        settings = get_settings()
+        pause = max(0.0, float(settings.enrich_batch_pause_seconds))
+        q = (
+            select(CampaignItem)
+            .join(Campaign, CampaignItem.campaign_id == Campaign.id)
+            .where(
+                CampaignItem.stage == ItemStageStatus.DISCOVERED.value,
+                Campaign.niche == niche,
+            )
+            .options(
+                selectinload(CampaignItem.company),
+                selectinload(CampaignItem.contact),
+                selectinload(CampaignItem.campaign),
+            )
+            .limit(max(1, int(limit)))
+        )
+        if exclude_campaign_id:
+            q = q.where(CampaignItem.campaign_id != exclude_campaign_id)
+        items = list((await self.session.execute(q)).scalars().all())
+        enriched = 0
+        discarded = 0
+        for item in items:
+            camp = item.campaign
+            if not camp:
+                continue
+            status = await self._enrich_item(item, camp, pause=pause)
+            if status == "enriched":
+                enriched += 1
+            elif status == "discarded":
+                discarded += 1
+        await self.session.flush()
+        logger.info("enrich_ready_done", niche=niche, enriched=enriched, discarded=discarded)
+        return {"stage": "enrich_ready", "enriched": enriched, "discarded": discarded, "seen": len(items)}
+
+    async def crm_ready(
+        self,
+        *,
+        niche: str,
+        limit: int,
+        exclude_campaign_id: str | None = None,
+    ) -> dict[str, Any]:
+        q = (
+            select(CampaignItem)
+            .join(Campaign, CampaignItem.campaign_id == Campaign.id)
+            .where(
+                CampaignItem.stage == ItemStageStatus.ENRICHED.value,
+                Campaign.niche == niche,
+            )
+            .options(
+                selectinload(CampaignItem.company),
+                selectinload(CampaignItem.contact),
+                selectinload(CampaignItem.campaign),
+            )
+            .limit(max(1, int(limit)))
+        )
+        if exclude_campaign_id:
+            q = q.where(CampaignItem.campaign_id != exclude_campaign_id)
+        items = list((await self.session.execute(q)).scalars().all())
+        synced = 0
+        failed = 0
+        sync = CRMSyncService()
+        for item in items:
+            camp = item.campaign
+            if not camp:
+                continue
+            ok = await self._crm_item(item, camp, sync=sync)
+            if ok:
+                synced += 1
+            else:
+                failed += 1
+        await self.session.flush()
+        logger.info("crm_ready_done", niche=niche, synced=synced, failed=failed)
+        return {"stage": "crm_ready", "synced": synced, "failed": failed, "seen": len(items)}
+
     # ------------------------------------------------------------------
     # 3) CRM
     # ------------------------------------------------------------------
@@ -480,42 +542,9 @@ class StageService:
         sync = CRMSyncService()
 
         for item in items:
-            company = item.company
-            contact = item.contact
-            if not company or not contact or not contact.email:
-                item.stage = ItemStageStatus.FAILED.value
-                item.error_message = "sem contact/email para CRM"
-                failed += 1
-                continue
-            extra = company.extra or {}
-            desc = extra.get("crm_description") or (
-                f"LG Prospector | origem={extra.get('origin') or campaign.niche} | {campaign.id}"
-            )
-            res = await sync.sync_prospect(
-                company_name=company.name,
-                contact_name=contact.name,
-                email=contact.email,
-                phone=contact.phone or company.phone or "",
-                website=company.website or "",
-                city=company.city or "",
-                state=company.state or "",
-                niche=campaign.niche,
-                description=str(desc)[:10000],
-            )
-            item.crm_company_id = res.account_id
-            item.crm_contact_id = res.contact_id
-            item.crm_lead_id = res.lead_id
-            if res.account_id:
-                company.crm_id = res.account_id
-            if res.contact_id:
-                contact.crm_id = res.contact_id
-            if res.ok:
-                item.stage = ItemStageStatus.CRM_SYNCED.value
-                item.status = ItemStatus.CRM_CREATED.value
+            if await self._crm_item(item, campaign, sync=sync):
                 synced += 1
             else:
-                item.stage = ItemStageStatus.FAILED.value
-                item.error_message = "; ".join(res.errors or ["crm failed"])
                 failed += 1
 
         campaign.current_stage = CampaignStage.CRM.value
@@ -1104,6 +1133,129 @@ class StageService:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    async def _enrich_item(
+        self, item: CampaignItem, campaign: Campaign, *, pause: float
+    ) -> str:
+        company = item.company
+        if not company:
+            item.stage = ItemStageStatus.DISCARDED.value
+            item.status = ItemStatus.SKIPPED.value
+            return "discarded"
+
+        raw = item.raw_data or {}
+        seed_email = (company.email or raw.get("email") or "") or ""
+        pr = ProviderResult(
+            company_name=company.name,
+            website=company.website or "",
+            phone=company.phone or "",
+            email=seed_email,
+            city=company.city or "",
+            state=company.state or "",
+            segment=company.segment or campaign.niche,
+            source=company.source or "",
+            contact_name=(raw.get("contact_name") or "") or "",
+            extra=company.extra or raw,
+        )
+        if not pr.is_valid_company():
+            item.stage = ItemStageStatus.DISCARDED.value
+            item.status = ItemStatus.SKIPPED.value
+            item.error_message = "candidato inválido/lixo"
+            logger.info("enrich_prefilter_discard", company=company.name)
+            return "discarded"
+
+        domain = item.company_domain or extract_registrable_domain(company.website or "")
+        niche_l = (campaign.niche or "").lower()
+        is_politico = niche_l in {"politico", "partido"}
+        is_generalista = niche_l == "generalista"
+        require_domain = bool(domain) and not is_politico and not is_generalista
+        kept = await require_email(
+            pr,
+            deep=True,
+            require_domain=require_domain,
+            allow_free_mail=is_politico or is_generalista or not domain,
+        )
+        if not kept or not has_valid_email(kept.email):
+            item.stage = ItemStageStatus.DISCARDED.value
+            item.status = ItemStatus.SKIPPED.value
+            item.error_message = "sem e-mail"
+            logger.info("enrich_discarded", company=company.name, domain=domain)
+            if pause:
+                await asyncio.sleep(pause)
+            return "discarded"
+
+        company.email = kept.email
+        if kept.phone:
+            company.phone = kept.phone
+        if kept.website and not company.website:
+            company.website = kept.website
+            company.website_host = extract_registrable_domain(kept.website)
+
+        contact = Contact(
+            id=uuid4().hex,
+            company_id=company.id,
+            name=(kept.contact_name or company.name)[:255],
+            email=kept.email,
+            phone=kept.phone or company.phone,
+            source=kept.source,
+            extra=kept.extra,
+        )
+        self.session.add(contact)
+        await self.session.flush()
+
+        item.contact_id = contact.id
+        item.stage = ItemStageStatus.ENRICHED.value
+        item.status = ItemStatus.EMAIL_FOUND.value
+        item.company_domain = domain or extract_registrable_domain(company.website or "")
+        item.qualification_notes = f"email domínio={item.company_domain}"
+        item.raw_data = {**(item.raw_data or {}), **kept.model_dump()}
+        if pause:
+            await asyncio.sleep(pause)
+        return "enriched"
+
+    async def _crm_item(
+        self,
+        item: CampaignItem,
+        campaign: Campaign,
+        *,
+        sync: CRMSyncService | None = None,
+    ) -> bool:
+        sync = sync or CRMSyncService()
+        company = item.company
+        contact = item.contact
+        if not company or not contact or not contact.email:
+            item.stage = ItemStageStatus.FAILED.value
+            item.error_message = "sem contact/email para CRM"
+            return False
+        extra = company.extra or {}
+        desc = extra.get("crm_description") or (
+            f"LG Prospector | origem={extra.get('origin') or campaign.niche} | {campaign.id}"
+        )
+        res = await sync.sync_prospect(
+            company_name=company.name,
+            contact_name=contact.name,
+            email=contact.email,
+            phone=contact.phone or company.phone or "",
+            website=company.website or "",
+            city=company.city or "",
+            state=company.state or "",
+            niche=campaign.niche,
+            description=str(desc)[:10000],
+        )
+        item.crm_company_id = res.account_id
+        item.crm_contact_id = res.contact_id
+        item.crm_lead_id = res.lead_id
+        if res.account_id:
+            company.crm_id = res.account_id
+        if res.contact_id:
+            contact.crm_id = res.contact_id
+        if res.ok:
+            item.stage = ItemStageStatus.CRM_SYNCED.value
+            item.status = ItemStatus.CRM_CREATED.value
+            return True
+        item.stage = ItemStageStatus.FAILED.value
+        item.error_message = "; ".join(res.errors or ["crm failed"])
+        return False
+
     async def _items_in_stage(self, campaign_id: str, stage: str) -> list[CampaignItem]:
         result = await self.session.execute(
             select(CampaignItem)

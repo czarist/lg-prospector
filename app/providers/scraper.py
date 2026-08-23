@@ -91,6 +91,13 @@ EMAIL_BLOCKLIST_SUBSTR = (
     "noreply@",
     "no-reply@",
     "donotreply@",
+    "privacidade@",
+    "privacy@",
+    "lgpd@",
+    "dpo@",
+    "ouvidoria@",
+    "webmaster@",
+    "abuse@",
     "mailer-daemon",
     "webpack",
     "localhost",
@@ -141,6 +148,8 @@ class ScrapeResult:
     pages_visited: list[str] = field(default_factory=list)
     method: str = ""  # httpx | playwright | mixed
     raw_text_sample: str = ""
+    br_signals: list[str] = field(default_factory=list)
+    foreign_signals: list[str] = field(default_factory=list)
     error: str | None = None
 
     @property
@@ -159,6 +168,30 @@ def normalize_url(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     return url.rstrip("/")
+
+
+_IPV6_URL_RE = re.compile(r"^https?://\[[0-9a-fA-F:.]+\]", re.IGNORECASE)
+
+
+def _href_usable(href: str) -> bool:
+    """Href que o urljoin do Python 3.13 não trata como IPv6/BBCode lixo."""
+    h = (href or "").strip()
+    if not h:
+        return False
+    if h.startswith(("[", "{", "<")):
+        return False
+    if "[" in h and not _IPV6_URL_RE.match(h):
+        return False
+    return True
+
+
+def _safe_urljoin(base: str, href: str) -> str:
+    if not _href_usable(href):
+        return ""
+    try:
+        return urljoin((base or "").rstrip("/") + "/", href.strip())
+    except ValueError:
+        return ""
 
 
 def _same_host(base: str, candidate: str) -> bool:
@@ -259,10 +292,15 @@ def extract_contact_links(html: str, base_url: str, max_links: int = 8) -> list[
             continue
         if href.lower().startswith("mailto:"):
             continue  # e-mail já capturado no texto
-        full = urljoin(base_url + "/", href)
+        full = _safe_urljoin(base_url, href)
+        if not full:
+            continue
         if not _same_host(base_url, full):
             continue
-        path = urlparse(full).path.lower()
+        try:
+            path = urlparse(full).path.lower()
+        except ValueError:
+            continue
         text = (a.get_text(" ") or "").lower()
         blob = f"{path} {text} {href.lower()}"
         if any(h in blob for h in CONTACT_PATH_HINTS):
@@ -405,8 +443,20 @@ async def scrape_website(
             return
         all_emails.extend(emails)
         all_phones.extend(phones)
+        from app.providers.geo_email import inspect_html_nationality
+
+        br, fo = inspect_html_nationality(html)
+        for sig in br:
+            if sig not in result.br_signals:
+                result.br_signals.append(sig)
+        for sig in fo:
+            if sig not in result.foreign_signals:
+                result.foreign_signals.append(sig)
         if not result.raw_text_sample:
-            result.raw_text_sample = text[:500]
+            # cabeçalho + rodapé (CNPJ/endereço costumam estar no fim)
+            head = text[:400]
+            tail = text[-900:] if len(text) > 900 else ""
+            result.raw_text_sample = f"{head}\n{tail}".strip()[:1400]
 
     # 1) Home httpx
     html = await fetch_httpx(base, timeout=timeout)

@@ -37,6 +37,9 @@ class CRMClient:
         # ESPO_CRM_TOKEN tem prioridade (API key ou user:password)
         self.api_token = (api_token if api_token is not None else settings.espo_crm_token).strip()
         self._session_token: Optional[str] = None
+        self._assigned_user_id: Optional[str] = (
+            (settings.crm_assigned_user_id or "").strip() or None
+        )
         self._auth_mode = self._resolve_auth_mode()
         self._enabled = bool(self.base_url) and (
             bool(self.api_token) or bool(self.password)
@@ -89,14 +92,38 @@ class CRMClient:
         token = data.get("token")
         if token:
             self._session_token = token
+        self._remember_user(data)
         user_name = (data.get("user") or {}).get("userName") or self.user
         logger.info(
             "crm_authenticated",
             user=user_name,
             auth_mode=self._auth_mode,
             has_session_token=bool(token),
+            assigned_user_id=self._assigned_user_id,
         )
         return data
+
+    def _remember_user(self, data: dict[str, Any]) -> None:
+        user = data.get("user") if isinstance(data, dict) else None
+        if isinstance(user, dict):
+            uid = str(user.get("id") or "").strip()
+            if uid:
+                self._assigned_user_id = uid
+
+    async def assigned_user_id(self) -> str:
+        """User id do Espo para assignedUserId (Task exige)."""
+        if self._assigned_user_id:
+            return self._assigned_user_id
+        try:
+            data = await self.request("GET", "/App/user")
+        except Exception as exc:
+            logger.warning("crm_assigned_user_fetch_failed", error=str(exc)[:200])
+            return ""
+        token = data.get("token")
+        if token:
+            self._session_token = token
+        self._remember_user(data)
+        return self._assigned_user_id or ""
 
     async def request(
         self,
@@ -111,7 +138,10 @@ class CRMClient:
 
             logger.debug("crm_dry_run", method=method, path=path, auth_mode=self._auth_mode)
             if method.upper() == "GET" and path.rstrip("/").endswith("user"):
-                return {"token": "dry-run-token", "user": {"userName": self.user}}
+                return {
+                    "token": "dry-run-token",
+                    "user": {"id": "dry-run-user", "userName": self.user},
+                }
             if method.upper() == "GET":
                 return {"total": 0, "list": []}
             payload = json if isinstance(json, dict) else {}
@@ -245,7 +275,12 @@ class CRMClient:
         return True
 
     async def create(self, entity: str, data: dict[str, Any]) -> dict[str, Any]:
-        return await self.request("POST", f"/{entity}", json=data)
+        payload = dict(data or {})
+        if entity == "Task" and not payload.get("assignedUserId"):
+            uid = await self.assigned_user_id()
+            if uid:
+                payload["assignedUserId"] = uid
+        return await self.request("POST", f"/{entity}", json=payload)
 
     async def update(self, entity: str, record_id: str, data: dict[str, Any]) -> dict[str, Any]:
         return await self.request("PUT", f"/{entity}/{record_id}", json=data)

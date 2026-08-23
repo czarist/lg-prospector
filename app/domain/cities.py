@@ -1,8 +1,7 @@
 """Escada de cidades comercialmente relevantes (população / PIB / capital).
 
-Evita município pequeno: só entram capitais, DF e polos econômicos.
-Foco RS: Porto Alegre + cidades gaúchas de alto peso comercial antes
-do restante do Brasil.
+Padrão da caçada: Brasil inteiro (sem travar município).
+A escada cidade a cidade é opt-in (--no-nationwide / --focus-rs / --only-rs).
 
 Fonte: curadoria estática (IBGE pop ~2022–2024 / relevância PIB municipal).
 Não baixa API externa — lista estável e barata em token.
@@ -13,14 +12,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+NATIONWIDE_LABEL = "Brasil"
+_NATIONWIDE_CITIES = frozenset({"brasil", "brazil", "br", "país", "pais"})
+_NATIONWIDE_STATES = frozenset({"", "BR", "BRASIL"})
+
 
 @dataclass(frozen=True, slots=True)
 class CityTarget:
     city: str
-    state: str  # UF
-    tier: int  # 1=capital/DF, 2=polo regional, 3=secundário importante
+    state: str  # UF (vazio = nacional)
+    tier: int  # 0=país, 1=capital/DF, 2=polo regional, 3=secundário importante
     population_k: int  # mil habitantes (aprox.)
-    region: str = ""  # sul | sudeste | centro-oeste | nordeste | norte
+    region: str = ""  # nacional | sul | sudeste | centro-oeste | nordeste | norte
     notes: str = ""
 
     @property
@@ -29,14 +32,43 @@ class CityTarget:
 
     @property
     def label(self) -> str:
+        if not (self.state or "").strip():
+            return self.city
         return f"{self.city}/{self.state}"
 
+    @property
+    def nationwide(self) -> bool:
+        return is_nationwide(self.city, self.state)
+
+
+def is_nationwide(city: str = "", state: str = "") -> bool:
+    """True se a busca é o país inteiro (sem município)."""
+    c = (city or "").strip().lower()
+    s = (state or "").strip().upper()
+    if c in _NATIONWIDE_CITIES:
+        return True
+    return not c and s in _NATIONWIDE_STATES
+
+
+def search_location(city: str = "", state: str = "") -> str:
+    """Texto de local para query de busca. Vazio / Brasil = 'Brasil'."""
+    if is_nationwide(city, state):
+        return NATIONWIDE_LABEL
+    parts = [(city or "").strip()]
+    st = (state or "").strip()
+    if st and st.upper() not in _NATIONWIDE_STATES:
+        parts.append(st)
+    return " ".join(p for p in parts if p)
+
+
+def nationwide_target() -> CityTarget:
+    return CityTarget(NATIONWIDE_LABEL, "", 0, 203000, "nacional", "todo o país")
+
 
 # ---------------------------------------------------------------------------
-# Tier 1 — Capitais + DF (prioridade nacional; RS primeiro na ordenação)
+# Tier 1 — Capitais + DF (ordem da lista é irrelevante; a fila reordena)
 # ---------------------------------------------------------------------------
 _CAPITALS: list[CityTarget] = [
-    # RS primeiro (foco comercial pedido)
     CityTarget("Porto Alegre", "RS", 1, 1333, "sul", "capital RS"),
     CityTarget("Brasília", "DF", 1, 2817, "centro-oeste", "DF / sede federal"),
     CityTarget("São Paulo", "SP", 1, 11450, "sudeste", "maior economia"),
@@ -136,7 +168,7 @@ def all_city_targets() -> list[CityTarget]:
 
 def build_city_queue(
     *,
-    focus_rs: bool = True,
+    focus_rs: bool = False,
     max_tier: int = 2,
     min_population_k: int = 90,
     only_rs: bool = False,
@@ -147,10 +179,9 @@ def build_city_queue(
     """
     Monta fila de cidades na ordem da 'escadinha':
 
-    1. Capitais (RS primeiro se focus_rs)
-    2. Polos RS (se focus_rs)
-    3. Outros polos nacionais (pop/PIB)
-    4. Tier 3 só se max_tier>=3
+    1. Capitais (por população; RS primeiro só se focus_rs)
+    2. Polos RS + polos nacionais (pop/PIB) — RS polos sempre entram no recorte nacional
+    3. Tier 3 só se max_tier>=3
 
     min_population_k descarta município pequeno (default 90k).
     """
@@ -158,7 +189,6 @@ def build_city_queue(
 
     capitals = list(_CAPITALS)
     if focus_rs:
-        # já está com POA primeiro; reforça: RS capital no topo
         capitals = sorted(
             capitals,
             key=lambda c: (
@@ -166,18 +196,22 @@ def build_city_queue(
                 -c.population_k,
             ),
         )
+    else:
+        capitals = sorted(capitals, key=lambda c: -c.population_k)
 
-    rs_polos = list(_RS_POLOS) if focus_rs or only_rs else []
-    national = [] if only_rs else list(_NATIONAL_POLOS)
-    # ordena polos por pop desc
+    # polos gaúchos fazem parte do país; só saem se only_capitals
+    rs_polos = [] if only_capitals else list(_RS_POLOS)
+    national = [] if only_rs or only_capitals else list(_NATIONAL_POLOS)
     rs_polos = sorted(rs_polos, key=lambda c: -c.population_k)
     national = sorted(national, key=lambda c: -c.population_k)
 
     tier3 = list(_TIER3) if max_tier >= 3 else []
     if only_capitals:
         queue = capitals
-    else:
+    elif focus_rs:
         queue = capitals + rs_polos + national + tier3
+    else:
+        queue = capitals + sorted(rs_polos + national, key=lambda c: -c.population_k) + tier3
 
     out: list[CityTarget] = []
     seen: set[str] = set()
@@ -201,6 +235,46 @@ def build_city_queue(
     return out
 
 
+def resolve_hunt_cities(
+    *,
+    nationwide: bool = True,
+    focus_rs: bool = False,
+    only_rs: bool = False,
+    only_capitals: bool = False,
+    max_tier: int = 2,
+    min_population_k: int = 90,
+    limit: Optional[int] = None,
+    include_states: Optional[Iterable[str]] = None,
+    city: str = "",
+    state: str = "",
+) -> list[CityTarget]:
+    """Fila efetiva da caçada. Padrão: um alvo 'Brasil' (todo o país)."""
+    locked = (city or "").strip()
+    if locked and not is_nationwide(locked, state):
+        return [CityTarget(locked, (state or "").strip(), 1, 0, "")]
+
+    states = list(include_states) if include_states else None
+    use_ladder = (
+        (not nationwide)
+        or focus_rs
+        or only_rs
+        or only_capitals
+        or bool(states)
+        or (limit is not None and limit > 0)
+    )
+    if not use_ladder:
+        return [nationwide_target()]
+    return build_city_queue(
+        focus_rs=focus_rs,
+        max_tier=max_tier,
+        min_population_k=min_population_k,
+        only_rs=only_rs,
+        only_capitals=only_capitals,
+        limit=limit,
+        include_states=states,
+    )
+
+
 # Queries padrão por nicho (rotação)
 NICHE_QUERIES: dict[str, list[str]] = {
     "advogado": [
@@ -211,30 +285,49 @@ NICHE_QUERIES: dict[str, list[str]] = {
         "escritório advocacia trabalhista",
         "advogado cível escritório",
         "sociedade de advogados OAB",
+        "advogado tributarista escritório",
+        "advogado previdenciário escritório",
+        "advocacia imobiliária site contato",
     ],
     "agencia_marketing": [
         "agência de marketing digital",
         "agência de publicidade",
         "agência performance google ads",
         "agência de comunicação",
+        "agência inbound marketing",
+        "agência social media",
+        "estúdio branding design",
+        "agência SEO site contato",
     ],
     "empresa_ti": [
         "software house",
         "fábrica de software",
         "empresa de desenvolvimento de sistemas",
         "consultoria em ti",
+        "empresa de software erp",
+        "desenvolvimento de aplicativos",
+        "integradora de sistemas",
+        "suporte ti terceirizado",
     ],
     "prestador_servico": [
         "escritório de contabilidade",
         "contabilidade empresarial",
         "consultoria empresarial",
         "escritório contábil",
+        "assessoria fiscal empresa",
+        "consultoria financeira empresa",
+        "recursos humanos empresa",
+        "engenharia consultoria",
     ],
     "grupo_midiatico": [
         "portal de notícias",
         "jornal regional",
         "grupo de mídia",
         "rádio jornal",
+        "tv regional contato comercial",
+        "revista regional publicidade",
+        "portal de notícias contato comercial",
+        "rádio fm comercial",
     ],
     "politico": [
         # NÃO usar "gabinete" / portais .leg.br — puxa assembleia/câmara
@@ -244,6 +337,10 @@ NICHE_QUERIES: dict[str, list[str]] = {
         "candidato campanha site contato",
         "equipe de campanha contato email",
         "partido político diretório site oficial",
+        "vereador eleito contato email",
+        "pré-candidato prefeito contato email",
+        "coordenação de campanha partido email",
+        "assessoria de campanha contato",
     ],
     "generalista": [
         "empresa comércio site contato",
@@ -252,14 +349,23 @@ NICHE_QUERIES: dict[str, list[str]] = {
         "restaurante site institucional",
         "oficina loja indústria site",
         "prestador de serviço empresa site",
+        "farmácia drogaria site contato",
+        "construtora engenharia site",
+        "transportadora logística site",
+        "hotel pousada site",
+        "contabilidade escritório site",
+        "distribuidora atacado site",
     ],
 }
 
-# hunt_loop de nicho — sem generalista (rotina própria)
-DEFAULT_NICHES: list[str] = [k for k in NICHE_QUERIES if k != "generalista"]
+# hunt_loop de nicho — sem generalista nem prestador (prestador = faixa geral)
+DEFAULT_NICHES: list[str] = [
+    k for k in NICHE_QUERIES if k not in {"generalista", "prestador_servico"}
+]
 
 
 def pick_query(niche: str, city: str, round_idx: int = 0) -> str:
     qs = NICHE_QUERIES.get(niche) or [niche.replace("_", " ")]
     base = qs[round_idx % len(qs)]
-    return f"{base} {city}".strip()
+    loc = search_location(city)
+    return f"{base} {loc}".strip()

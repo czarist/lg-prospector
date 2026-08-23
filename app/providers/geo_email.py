@@ -7,6 +7,8 @@ ALAN MONTORO → alanchikinchow.com).
 
 Regras:
   - ccTLD estrangeiro / .edu/.gov/.mil sem .br → rejeita
+  - veículo/marca estrangeira conhecida (.com tipo foxnews/cnn) → rejeita
+  - HTML do site sem sinal BR (CNPJ, pt-BR, +55) e com sinal US/UK → rejeita
   - redes sociais, dicionários de nome, diretórios → rejeita
   - nicho pessoa (político/advogado): o local ou o domínio tem que
     bater com o nome (ou ser *.br com caixa genérica contato@)
@@ -80,6 +82,178 @@ _FOREIGN_SUFFIXES: tuple[str, ...] = (
     ".pt",  # Portugal — não é o nicho
     ".co.jp",
 )
+
+# Veículos / marcas .com que o SERP devolve como se fossem empresa BR.
+# .br (cnnbrasil.com.br) passa — é operação local.
+_FOREIGN_MEDIA_HOSTS: frozenset[str] = frozenset(
+    {
+        "foxnews.com",
+        "fox.com",
+        "foxbusiness.com",
+        "fox8live.com",
+        "fox26houston.com",
+        "fox5ny.com",
+        "fox5atlanta.com",
+        "cnn.com",
+        "bbc.com",
+        "bbc.co.uk",
+        "bbci.co.uk",
+        "nytimes.com",
+        "washingtonpost.com",
+        "wsj.com",
+        "reuters.com",
+        "apnews.com",
+        "ap.org",
+        "bloomberg.com",
+        "forbes.com",
+        "theguardian.com",
+        "thetimes.com",
+        "telegraph.co.uk",
+        "dailymail.co.uk",
+        "nypost.com",
+        "usatoday.com",
+        "latimes.com",
+        "nbcnews.com",
+        "nbc.com",
+        "cbsnews.com",
+        "cbs.com",
+        "abcnews.go.com",
+        "abc.com",
+        "msnbc.com",
+        "newsweek.com",
+        "time.com",
+        "politico.com",
+        "thehill.com",
+        "axios.com",
+        "huffpost.com",
+        "cnbc.com",
+        "marketwatch.com",
+        "businessinsider.com",
+        "aljazeera.com",
+        "dw.com",
+        "france24.com",
+        "sky.com",
+        "skysports.com",
+        "espn.com",
+        "ft.com",
+        "economist.com",
+        "news.com.au",
+        "abc.net.au",
+        "cbc.ca",
+        "globalnews.ca",
+        "ctvnews.ca",
+        "lefigaro.fr",
+        "lemonde.fr",
+        "elpais.com",
+        "elmundo.es",
+        "independent.co.uk",
+        "thesun.co.uk",
+        "variety.com",
+        "tmz.com",
+        "people.com",
+        # tech / SaaS / marcas globais que o SERP de TI/geral devolve
+        "salesforce.com",
+        "oracle.com",
+        "ibm.com",
+        "adobe.com",
+        "nvidia.com",
+        "intel.com",
+        "cisco.com",
+        "sap.com",
+        "hubspot.com",
+        "slack.com",
+        "dropbox.com",
+        "shopify.com",
+        "tesla.com",
+        "netflix.com",
+        "uber.com",
+        "airbnb.com",
+        "meta.com",
+        "openai.com",
+        "anthropic.com",
+        "microsoft.com",
+        "apple.com",
+        "amazon.com",
+        "aws.amazon.com",
+        "google.com",
+        "youtube.com",
+    }
+)
+_FOREIGN_MEDIA_SLDS: frozenset[str] = frozenset(
+    {
+        "foxnews",
+        "foxbusiness",
+        "fox8live",
+        "nytimes",
+        "washingtonpost",
+        "reuters",
+        "bloomberg",
+        "theguardian",
+        "dailymail",
+        "nbcnews",
+        "cbsnews",
+        "msnbc",
+        "aljazeera",
+        "businessinsider",
+    }
+)
+
+_FOREIGN_NAME_RE = re.compile(
+    r"(?ix)"
+    r"(?:^|\b)("
+    r"fox\s*news|foxnews|fox\s*\d+|fox\s+8|"
+    r"\bcnn\b|bbc(\s+news)?|new\s+york\s+times|nytimes|"
+    r"washington\s+post|wall\s+street\s+journal|\breuters\b|"
+    r"associated\s+press|\bnbc\s*news\b|\bcbs\s*news\b|abc\s+news|\bmsnbc\b|"
+    r"usa\s+today|los\s+angeles\s+times|the\s+guardian|"
+    r"daily\s+mail|\bbloomberg\b|\bwvue\b"
+    r")(?:\b|$)"
+)
+_FOREIGN_GEO_RE = re.compile(
+    r"(?ix)\b("
+    r"new\s+orleans|new\s+york|los\s+angeles|chicago|miami|houston|"
+    r"dallas|atlanta|san\s+francisco|washington\s+d\.?c\.?|"
+    r"united\s+states|\bu\.?s\.?a\.?\b|united\s+kingdom|"
+    r"london|manchester|lisboa|lisbon"
+    r")\b"
+)
+
+_CNPJ_RE = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}\s*[\/]\s*\d{4}-?\d{2}\b")
+_CEP_RE = re.compile(r"\bCEP\s*:?\s*\d{5}-?\d{3}\b", re.I)
+_PLUS55_RE = re.compile(r"\+55\D{0,3}\d{2}")
+_HTML_LANG_RE = re.compile(
+    r"<html\b[^>]*\slang\s*=\s*['\"]\s*([a-zA-Z]{2}(?:[-_][a-zA-Z]{2})?)",
+    re.I,
+)
+_META_LOCALE_RE = re.compile(
+    r"""content\s*=\s*['"]?(pt[-_]BR|en[-_]US|en[-_]GB)['"]?"""
+    r"""|['"](?:og:locale|language)['"][^>]*content\s*=\s*['"]([^'"]+)""",
+    re.I,
+)
+_BR_HTML_PHRASES = (
+    "cnpj",
+    "cpf",
+    "inscrição estadual",
+    "inscricao estadual",
+    "razão social",
+    "razao social",
+    "fale conosco",
+    "política de privacidade",
+    "politica de privacidade",
+    "todos os direitos reservados",
+)
+_FOREIGN_HTML_PHRASES = (
+    "united states",
+    "u.s.a",
+    "new york",
+    "new orleans",
+    "los angeles",
+    "washington, d",
+    "fcc public",
+    "public file",
+    "headquartered in",
+)
+_FOREIGN_EMAIL_LOCALS = frozenset({"publicfile", "public.file", "fcc"})
 
 # hosts de e-mail que nunca são contato comercial/campanha
 JUNK_EMAIL_DOMAINS: frozenset[str] = frozenset(
@@ -279,7 +453,8 @@ _JUNK_NAME_RE = re.compile(
     r"("
     r"^(melhores|as\s+melhores|os\s+melhores|top\s+\d+|10\s+melhores|"
     r"50\s+maiores|vagas\s+(de|para|em)|vagas\s+de\s+emprego|"
-    r"shop\s+)"
+    r"shop\s+|o que [eé]\b|como funciona|saiba (mais|como)|veja como|"
+    r"entenda |resumo sobre|conceitos\b|contagem regressiva)"
     r"|vagas\s+de\s+"
     r"|vagas\s+para\s+"
     r"|vagas\s+de\s+emprego"
@@ -291,7 +466,37 @@ _JUNK_NAME_RE = re.compile(
     r"|correspondentes\s+jur[ií]dicos"
     r"|encontra\s+brasil"
     r"|guia\s+telef"
+    r"|wikip[eé]dia"
+    r"|defini[cç][aã]o de"
+    r"|dicion[aá]rio"
+    r"|falta um m[eê]s"
+    r"|festa de s[aã]o"
+    r"|:\s*(conceitos|impactos|defini|o que)"
     r")"
+)
+_GENERIC_SOLE_NAMES = frozenset(
+    {
+        "equipe",
+        "wikipedia",
+        "sociedade",
+        "software",
+        "home",
+        "blog",
+        "contato",
+        "noticias",
+        "notícias",
+        "artigo",
+        "links",
+        "download",
+        "downloads",
+    }
+)
+_CAMPAIGN_NAME_RE = re.compile(
+    r"(?ix)"
+    r"(^campanha\b)"
+    r"|(\bcampanha\s+[A-ZÁÉÍÓÚÂÊÔÃÕÜ])"
+    r"|(\(\s*(PT|PL|PSOL|MDB|UNI[AÃ]O|PP|PSDB|PDT|REPUBLICANOS|"
+    r"AGIR|PODE|NOVO|PCDOB|PV|CIDADANIA|SOLIDARIEDADE|PRD|DC|PSB)\s*\))"
 )
 
 _CITY_ONLY_NAME_RE = re.compile(
@@ -375,6 +580,27 @@ NICHE_HINTS: dict[str, tuple[str, ...]] = {
 
 _PERSON_SEGMENTS = frozenset(
     {"politico", "partido", "advogado", "advogados"}
+)
+
+# caixas que nunca são contato comercial (LGPD, NDR, ouvidoria)
+_NON_CONTACT_LOCALS = frozenset(
+    {
+        "privacidade",
+        "privacy",
+        "lgpd",
+        "dpo",
+        "dataprotection",
+        "noreply",
+        "no-reply",
+        "donotreply",
+        "no_reply",
+        "ouvidoria",
+        "webmaster",
+        "abuse",
+        "postmaster",
+        "mailer-daemon",
+        "mailerdaemon",
+    }
 )
 
 _GENERIC_LOCALS = frozenset(
@@ -498,6 +724,187 @@ def is_foreign_cctld(domain_or_host: str) -> bool:
     return False
 
 
+def site_origin(url: str) -> str:
+    """https://www.foxnews.com/politics/foo → https://www.foxnews.com/"""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw
+    if not parsed.netloc:
+        return raw
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}/"
+
+
+def is_known_foreign_host(url_or_host: str) -> bool:
+    """Fox News, CNN.com, BBC… — não .br (CNN Brasil passa)."""
+    host = _host(url_or_host) or (url_or_host or "").lower().removeprefix("www.")
+    if not host or host.endswith(".br"):
+        return False
+    reg = extract_registrable_domain(host) or host
+    for blocked in _FOREIGN_MEDIA_HOSTS:
+        if host == blocked or host.endswith("." + blocked) or reg == blocked:
+            return True
+    sld = reg.split(".")[0] if reg else ""
+    return sld in _FOREIGN_MEDIA_SLDS
+
+
+def _name_claims_brazil(name: str) -> bool:
+    n = fold(name)
+    if "brasil" in n or "brazil" in n:
+        return True
+    return bool(
+        re.search(r"\b(ltda|eireli|me|epp|s/?a|s\.a\.?)\b", n)
+    )
+
+
+def is_foreign_company(
+    *,
+    name: str = "",
+    website: str = "",
+    email: str = "",
+    snippet: str = "",
+) -> bool:
+    """True se o lead é claramente empresa/veículo de outro país.
+
+    snippet não entra no nome — artigo sobre o Brasil cita 'Brasil' e
+    'Fox News' no mesmo parágrafo.
+    """
+    del snippet  # não usar: SERP mistura veículo estrangeiro + pauta BR
+    host = _host(website)
+    email_dom = ""
+    if email and "@" in email:
+        email_dom = email.rsplit("@", 1)[-1].lower().removeprefix("www.")
+    if is_br_domain(host) or is_br_domain(email_dom):
+        return False
+    if _name_claims_brazil(name):
+        return False
+    if is_known_foreign_host(website) or is_known_foreign_host(email_dom):
+        return True
+    if is_foreign_cctld(website) or is_foreign_cctld(email_dom):
+        return True
+    n = fold(name)
+    if n and _FOREIGN_GEO_RE.search(n):
+        return True
+    if n and _FOREIGN_NAME_RE.search(n):
+        return True
+    return False
+
+
+def keep_brazilian_search_hit(
+    *,
+    title: str = "",
+    link: str = "",
+    snippet: str = "",
+    email: str = "",
+) -> bool:
+    """Vale para todo nicho e o generalista: SERP/places/news só se não for gringo."""
+    if is_known_foreign_host(link):
+        return False
+    if is_foreign_company(name=title, website=link, email=email, snippet=snippet):
+        return False
+    return True
+
+
+def inspect_html_nationality(html: str) -> tuple[list[str], list[str]]:
+    """Sinais BR vs estrangeiro no HTML/texto do site (CNPJ, lang, +55…)."""
+    raw = html or ""
+    if not raw:
+        return [], []
+    sample = raw[:80_000]
+    low = fold(sample)
+    br: list[str] = []
+    fo: list[str] = []
+
+    langs: list[str] = []
+    m_lang = _HTML_LANG_RE.search(sample)
+    if m_lang:
+        langs.append(m_lang.group(1).lower().replace("_", "-"))
+    for m in _META_LOCALE_RE.finditer(sample):
+        loc = (m.group(1) or m.group(2) or "").lower().replace("_", "-")
+        if loc:
+            langs.append(loc)
+
+    if any(x.startswith("pt") for x in langs):
+        br.append("lang_pt")
+    if any(x in {"en-us", "en-gb"} or x.startswith("en-") for x in langs):
+        fo.append("lang_en")
+
+    if _CNPJ_RE.search(sample) or "cnpj" in low:
+        br.append("cnpj")
+    if _CEP_RE.search(sample):
+        br.append("cep")
+    if _PLUS55_RE.search(sample):
+        br.append("+55")
+    if "r$" in low:
+        br.append("brl")
+    for phrase in _BR_HTML_PHRASES:
+        if fold(phrase) in low:
+            br.append(fold(phrase).replace(" ", "_")[:24])
+            break
+
+    for phrase in _FOREIGN_HTML_PHRASES:
+        if fold(phrase) in low:
+            fo.append(fold(phrase).replace(" ", "_")[:24])
+            break
+
+    def _uniq(items: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for it in items:
+            if it not in seen:
+                seen.add(it)
+                out.append(it)
+        return out
+
+    return _uniq(br), _uniq(fo)
+
+
+_STRONG_BR_SIGNALS = frozenset(
+    {
+        "lang_pt",
+        "cnpj",
+        "cep",
+        "+55",
+        "fale_conosco",
+        "razao_social",
+        "inscricao_estadual",
+        "politica_de_privacidade",
+        "todos_os_direitos_reserv",
+    }
+)
+
+
+def verdict_from_html_signals(br: list[str], fo: list[str]) -> str:
+    """br | foreign | inconclusive.
+
+    R$ / WhatsApp soltos não salvam um site en-US com endereço em NY.
+    """
+    strong_br = [s for s in br if s in _STRONG_BR_SIGNALS]
+    if strong_br:
+        return "br"
+    if fo:
+        return "foreign"
+    if br:
+        return "br"
+    return "inconclusive"
+
+
+def html_says_foreign(html: str) -> bool:
+    """True só quando o HTML aponta outro país e nenhum sinal BR forte."""
+    br, fo = inspect_html_nationality(html)
+    return verdict_from_html_signals(br, fo) == "foreign"
+
+
+def html_says_brazilian(html: str) -> bool:
+    br, fo = inspect_html_nationality(html)
+    return verdict_from_html_signals(br, fo) == "br"
+
+
 def is_junk_email_domain(domain: str) -> bool:
     d = (domain or "").lower().removeprefix("www.")
     if d in JUNK_EMAIL_DOMAINS:
@@ -545,7 +952,7 @@ def is_plausible_br_website(url: str) -> bool:
     host = _host(url)
     if not host:
         return False
-    if is_foreign_cctld(host):
+    if is_foreign_cctld(host) or is_known_foreign_host(url):
         return False
     return True
 
@@ -554,11 +961,37 @@ def is_junk_lead_name(name: str) -> bool:
     n = (name or "").strip()
     if not n:
         return True
+    if fold(n) in _GENERIC_SOLE_NAMES:
+        return True
+    if ":" in n and len(n) > 40:
+        return True
     if _CITY_ONLY_NAME_RE.match(n):
         return True
     if _JUNK_NAME_RE.search(n):
         return True
     return False
+
+
+def looks_like_campaign_name(name: str, extra: dict | None = None) -> bool:
+    """Nome/origem de campanha ou partido — não recebe template generalista."""
+    extra = extra or {}
+    origin = str(
+        extra.get("review_origin_niche")
+        or extra.get("origin")
+        or extra.get("segment")
+        or ""
+    ).lower()
+    if origin in {"politico", "partido"}:
+        return True
+    n = (name or "").strip()
+    if not n:
+        return False
+    if _CAMPAIGN_NAME_RE.search(n):
+        return True
+    folded = fold(n)
+    if folded.startswith("campanha"):
+        return True
+    return bool(re.match(r"(?ix)^(psol|mdb|partido dos|partido liberal|diretorio|diretório)\b", n))
 
 
 def niche_has_hint(name: str, website: str, snippet: str, segment: str) -> bool:
@@ -595,6 +1028,8 @@ def is_plausible_lead(
     segment: str = "",
 ) -> bool:
     """Empresa/lead que pode entrar no pipeline (todos os nichos)."""
+    if is_foreign_company(name=name, website=website, email=email, snippet=snippet):
+        return False
     seg = (segment or "").lower()
     # generalista: só “é um negócio” + “é do Brasil”
     if seg == "generalista":
@@ -647,7 +1082,11 @@ def _looks_like_br_business(
     e não estrangeiro. Sem exigir nicho, domínio próprio nem marca."""
     if not (name or "").strip():
         return False
+    if is_foreign_company(name=name, website=website, email=email, snippet=snippet):
+        return False
     if is_junk_lead_name(name):
+        return False
+    if looks_like_campaign_name(name):
         return False
     from app.providers.public_org import is_public_organ
 
@@ -793,8 +1232,15 @@ def classify_contact_email(
         return False, "sintaxe"
     if is_junk_email_domain(domain) or is_directory_host(domain):
         return False, "dominio_lixo"
-    if is_foreign_cctld(domain):
+    if is_foreign_cctld(domain) or is_known_foreign_host(domain):
         return False, "tld_estrangeiro"
+    if local in _FOREIGN_EMAIL_LOCALS:
+        return False, "empresa_estrangeira"
+    local_head = local.split(".", 1)[0].split("+", 1)[0].replace("-", "")
+    if local in _NON_CONTACT_LOCALS or local_head in _NON_CONTACT_LOCALS:
+        return False, "caixa_nao_contato"
+    if is_foreign_company(name=name, website=website or domain, email=addr):
+        return False, "empresa_estrangeira"
 
     from app.providers.public_org import is_gov_br_email, is_public_email
 

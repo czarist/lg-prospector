@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sobe nicho + generalista + mailman e abre o painel.
+# Sobe nicho + generalista + reviewer + auditor + mailman e abre o painel.
 # Uso: ./cockpit   |   ./cockpit --attach   |   ./cockpit --stop
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"

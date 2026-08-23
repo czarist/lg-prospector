@@ -18,22 +18,41 @@ class AgenciasMarketingProvider(SearchProviderMixin, BaseProvider):
     source_label = "linkedin"
 
     async def search_companies(self, ctx: SearchContext) -> list[ProviderResult]:
+        from app.domain.cities import search_location
+
         q = ctx.query or "agência de marketing"
-        li_q = f'site:linkedin.com/company {q}'
-        if ctx.city:
-            li_q += f" {ctx.city}"
-        results = await self._search_organic(
-            li_q, ctx.max_results, city=ctx.city, state=ctx.state
-        )
-
-        if len(results) < ctx.max_results:
-            web_q = build_maps_query(f"{q} digital", ctx.city, ctx.state)
+        loc = search_location(ctx.city, ctx.state)
+        round_idx = int((ctx.extra or {}).get("discover_round") or 0)
+        variants = [
+            f"site:linkedin.com/company {q} {loc}".strip(),
+            build_maps_query(f"{q} digital", ctx.city, ctx.state),
+            f"agência de publicidade {loc} site contato",
+            f"agência inbound marketing {loc}",
+            f"agência social media {loc} contato",
+            f"estúdio branding design {loc}",
+        ]
+        start = round_idx % len(variants)
+        queries = [variants[(start + i) % len(variants)] for i in range(4)]
+        results: list[ProviderResult] = []
+        seen: set[str] = set()
+        for qq in queries:
+            if len(results) >= ctx.max_results:
+                break
             more = await self._search_organic(
-                web_q, ctx.max_results - len(results), city=ctx.city, state=ctx.state
+                qq,
+                max(8, ctx.max_results - len(results)),
+                city=ctx.city,
+                state=ctx.state,
+                ctx=ctx,
             )
-            results.extend(more)
-
-        for r in results:
-            r.segment = self.segment
-            r.source = r.source or "linkedin"
-        return [r for r in results if r.is_valid_company()][: ctx.max_results]
+            for r in more:
+                r.segment = self.segment
+                r.source = r.source or "linkedin"
+                if not r.is_valid_company() or self._is_known_lead(r, ctx):
+                    continue
+                key = r.normalize_key()
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(r)
+        return results[: ctx.max_results]

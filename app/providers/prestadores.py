@@ -18,19 +18,40 @@ class PrestadoresProvider(SearchProviderMixin, BaseProvider):
     source_label = "google_maps"
 
     async def search_companies(self, ctx: SearchContext) -> list[ProviderResult]:
+        from app.domain.cities import search_location
+
         q = ctx.query or "prestador de serviços"
+        loc = search_location(ctx.city, ctx.state)
+        round_idx = int((ctx.extra or {}).get("discover_round") or 0)
+        extras = (
+            f"escritório de contabilidade {loc}",
+            f"consultoria empresarial {loc}",
+            f"assessoria fiscal {loc}",
+            f"recursos humanos empresa {loc}",
+            f"engenharia consultoria {loc}",
+        )
         maps_q = build_maps_query(q, ctx.city, ctx.state)
         results: list[ProviderResult] = []
+        seen: set[str] = set()
+
+        def _add(pr: ProviderResult) -> None:
+            if not pr.is_valid_company() or self._is_known_lead(pr, ctx):
+                return
+            key = pr.normalize_key()
+            if key in seen:
+                return
+            seen.add(key)
+            results.append(pr)
 
         places = await serper_search(
             maps_q,
-            num=ctx.max_results,
+            num=max(ctx.max_results, 10),
             search_type="places",
             city=ctx.city,
             state=ctx.state,
         )
-        for item in places[: ctx.max_results]:
-            results.append(
+        for item in places:
+            _add(
                 ProviderResult(
                     company_name=item.get("title") or item.get("name") or "",
                     website=item.get("website") or item.get("link") or "",
@@ -42,14 +63,23 @@ class PrestadoresProvider(SearchProviderMixin, BaseProvider):
                     extra={"address": item.get("address"), "raw": item},
                 )
             )
+            if len(results) >= ctx.max_results:
+                break
 
-        if len(results) < ctx.max_results:
+        queries = [maps_q, extras[round_idx % len(extras)]]
+        for qq in queries:
+            if len(results) >= ctx.max_results:
+                break
             more = await self._search_organic(
-                maps_q, ctx.max_results - len(results), city=ctx.city, state=ctx.state
+                qq,
+                max(8, ctx.max_results - len(results)),
+                city=ctx.city,
+                state=ctx.state,
+                ctx=ctx,
             )
             for r in more:
                 r.segment = self.segment
                 r.source = "google_search"
-            results.extend(more)
+                _add(r)
 
-        return [r for r in results if r.is_valid_company()][: ctx.max_results]
+        return results[: ctx.max_results]

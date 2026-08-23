@@ -5,7 +5,33 @@ from __future__ import annotations
 from app.domain.entities.provider_result import ProviderResult
 from app.domain.interfaces.provider import BaseProvider, SearchContext
 from app.providers.base_impl import SearchProviderMixin
+from app.providers.domain_email import extract_registrable_domain
+from app.providers.geo_email import is_known_foreign_host, site_origin
 from app.providers.http_tools import serper_search
+
+_BACKEND_SOURCES = frozenset(
+    {"serper", "bing", "duckduckgo", "duckduckgo_news", "google_news", "openstreetmap"}
+)
+
+
+def _outlet_from_news(item: dict) -> tuple[str, str]:
+    """Veículo (fonte), não o título da matéria. Site = origem, não o artigo."""
+    publisher = (
+        item.get("publisher") or item.get("source") or item.get("name") or ""
+    ).strip()
+    if publisher.lower() in _BACKEND_SOURCES:
+        publisher = ""
+    link = (item.get("link") or item.get("website") or item.get("url") or "").strip()
+    origin = site_origin(link)
+    if is_known_foreign_host(origin or link):
+        return "", ""
+    if publisher:
+        return publisher, origin or link
+    host = extract_registrable_domain(origin or link)
+    if not host or is_known_foreign_host(host):
+        return "", ""
+    label = host.split(".")[0].replace("-", " ").strip()
+    return (label.title() if label else ""), origin or link
 
 
 class GruposMidiaticosProvider(SearchProviderMixin, BaseProvider):
@@ -18,20 +44,42 @@ class GruposMidiaticosProvider(SearchProviderMixin, BaseProvider):
     source_label = "google_news"
 
     async def search_companies(self, ctx: SearchContext) -> list[ProviderResult]:
-        q = ctx.query or "jornal grupo de mídia comunicação"
-        results: list[ProviderResult] = []
+        from app.domain.cities import search_location
 
-        news_q = q
-        if ctx.city:
-            news_q = f"{q} {ctx.city}"
-        news = await serper_search(
-            news_q, num=ctx.max_results, search_type="news", city=ctx.city, state=ctx.state
+        q = ctx.query or "jornal grupo de mídia comunicação"
+        loc = search_location(ctx.city, ctx.state)
+        round_idx = int((ctx.extra or {}).get("discover_round") or 0)
+        extras = (
+            f"{q} publicidade comercial contato {loc}".strip(),
+            f"portal de notícias brasileiro {loc} contato comercial",
+            f"rádio jornal {loc} publicidade",
+            f"tv regional {loc} comercial",
+            f"revista regional {loc} anuncie",
         )
-        for item in news[: ctx.max_results]:
-            results.append(
+        results: list[ProviderResult] = []
+        seen: set[str] = set()
+
+        def _add(pr: ProviderResult) -> None:
+            if not pr.is_valid_company() or self._is_known_lead(pr, ctx):
+                return
+            key = pr.normalize_key()
+            if key in seen:
+                return
+            seen.add(key)
+            results.append(pr)
+
+        news_q = f"{q} {loc}".strip() if loc else q
+        news = await serper_search(
+            news_q, num=max(ctx.max_results, 10), search_type="news", city=ctx.city, state=ctx.state
+        )
+        for item in news:
+            name, origin = _outlet_from_news(item)
+            if not name or not origin:
+                continue
+            _add(
                 ProviderResult(
-                    company_name=self._clean_title(item.get("title") or item.get("source") or ""),
-                    website=item.get("link") or "",
+                    company_name=self._clean_title(name),
+                    website=origin,
                     city=ctx.city,
                     state=ctx.state,
                     segment=self.segment,
@@ -39,17 +87,22 @@ class GruposMidiaticosProvider(SearchProviderMixin, BaseProvider):
                     extra={"snippet": item.get("snippet"), "raw": item},
                 )
             )
+            if len(results) >= ctx.max_results:
+                break
 
-        if len(results) < ctx.max_results:
-            search_q = f"{q} publicidade comercial contato"
-            if ctx.city:
-                search_q += f" {ctx.city}"
+        for qq in (extras[round_idx % len(extras)], extras[(round_idx + 2) % len(extras)]):
+            if len(results) >= ctx.max_results:
+                break
             more = await self._search_organic(
-                search_q, ctx.max_results - len(results), city=ctx.city, state=ctx.state
+                qq,
+                max(8, ctx.max_results - len(results)),
+                city=ctx.city,
+                state=ctx.state,
+                ctx=ctx,
             )
             for r in more:
                 r.segment = self.segment
                 r.source = "google_search"
-            results.extend(more)
+                _add(r)
 
-        return [r for r in results if r.is_valid_company()][: ctx.max_results]
+        return results[: ctx.max_results]

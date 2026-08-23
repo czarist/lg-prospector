@@ -91,6 +91,7 @@ _HARD_REASONS = (
     "email:site_diretorio",
     "email:nome_lixo",
     "email:nao_e_negocio",
+    "email:empresa_estrangeira",
 )
 
 
