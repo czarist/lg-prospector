@@ -56,7 +56,6 @@ def render_html(
     rendered = (
         template.replace("{{EMPRESA}}", empresa)
         .replace("{{FRASE_PERSONALIZADA}}", frase)
-        .replace("{{UNSUBSCRIBE_URL}}", "#")
     )
     content_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
     return TEMPLATE_FILE, rendered, content_hash
